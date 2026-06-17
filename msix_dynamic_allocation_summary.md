@@ -483,3 +483,164 @@ guest unmask vector#2:
 ### 本地导出的 Patch 文件
 
 - `/home/yangjinqian/ai_output/0001*.patch` ~ `0011*.patch` (11 个 V5 版本完整 diff)
+
+---
+
+## 6. ARM64 上的动态 MSI-X 问题与进展
+
+### 6.1 现状
+
+ARM64 GIC ITS 的 PCI MSI domain **未设置** `MSI_FLAG_PCI_MSIX_ALLOC_DYN` flag：
+
+```c
+// x86: arch/x86/include/asm/msi.h:65
+#define X86_VECTOR_MSI_FLAGS_SUPPORTED  \
+    (MSI_GENERIC_FLAGS_MASK | MSI_FLAG_PCI_MSIX | MSI_FLAG_PCI_MSIX_ALLOC_DYN)
+
+// ARM64: drivers/irqchip/irq-gic-v3-its-msi-parent.c:17
+#define ITS_MSI_FLAGS_SUPPORTED  \
+    (MSI_GENERIC_FLAGS_MASK | MSI_FLAG_PCI_MSIX | MSI_FLAG_MULTI_PCI_MSI)
+    // ← 没有 MSI_FLAG_PCI_MSIX_ALLOC_DYN !
+```
+
+因此在 ARM64 上 `pci_msix_can_alloc_dyn()` 返回 false，VFIO 的 `has_dyn_msix` 为 false，
+NORESIZE 标志不会被清除。VFIO PCI 直通场景仍受"禁用→重分配→启用"旧方式限制，存在中断丢失风险。
+
+### 6.2 为什么 x86 解决了而 ARM64 还没解决
+
+核心原因是 **x86 和 ARM64 的中断硬件架构完全不同**。
+
+#### x86：天然支持，加个 flag 即可
+
+x86 的 MSI-X 直接写入 local APIC：
+
+- 每个 MSI message 包含 `{目标 APIC ID, vector号}` → APIC 直接路由到目标 CPU
+- 不需要任何中间翻译表
+- `pci_msi_prepare()` 只做一件事：`init_irq_alloc_info(arg, NULL)`，3 行代码
+- 新增 vector = 在目标 CPU 上分配一个空闲 vector 号，**无需任何全局结构变更**
+
+所以 x86 启用 `MSI_FLAG_PCI_MSIX_ALLOC_DYN` 就是加一个 flag，**零额外实现**。
+
+#### ARM64：三层翻译架构带来三个阻塞点
+
+GIC ITS 使用 **DeviceID + EventID → LPI** 的两级翻译：
+
+```
+PCI设备 → MSI-X Table(MSI地址+数据) → ITS翻译 → LPI → CPU
+```
+
+##### 阻塞点 1：ITT 必须一次性分配，大小在创建时固定
+
+`its_create_device()` 在 `msi_prepare()` 时创建设备，一次性：
+
+- 分配 ITT（大小 = `2^ceil(log2(nvecs))`，**必须是 2 的幂**）
+- 一次性分配 LPI bitmap + collection map
+- 发送 MAPD 命令给 ITS 硬件绑定设备与 ITT
+
+关键代码 (`drivers/irqchip/irq-gic-v3-its.c:3868`):
+
+```c
+nr_ites = max(2, nvecs);
+sz = nr_ites * (FIELD_GET(GITS_TYPER_ITT_ENTRY_SIZE, its->typer) + 1);
+sz = max(sz, ITS_ITT_ALIGN);
+itt = itt_alloc_pool(its->numa_node, sz);
+```
+
+ITT **大小在创建时就固定了**，ITS 硬件不支持在线 resize ITT。
+动态分配意味着每次新增 vector 时可能需要更大的 ITT，但无法在线扩展。
+解决方案只能在 `msi_prepare()` 时预分配足够大的 ITT（覆盖 hwsize），但这又需要
+`msi_prepare()` 在正确的时机被调用并拿到正确的大小参数。
+
+##### 阻塞点 2：`msi_prepare()` 调用时机错误
+
+ITS 的 `msi_prepare()` 有严格要求：**必须在设备生命周期内只调用一次**，在任何 MSI 分配之前。
+但旧 MSI 核心代码的调用时机是 "semi-random" 的（Marc Zyngier 的描述），导致 ITS
+不得不加了一个 ugly hack 来确保 ITT 足够大：
+
+```c
+// 旧代码 (irq-gic-v3-its-msi-parent.c，已被删除)
+msi_info = msi_get_domain_info(domain);
+if (msi_info->hwsize > nvec)
+    nvec = msi_info->hwsize;  // 强制向上取到 hwsize
+```
+
+这个 hack 恰恰是动态分配要**去掉**的东西——去掉后 ITT 大小才由实际分配的 nvec 决定，
+但去掉它需要先修好 `msi_prepare()` 的调用时机，否则 ITT 大小会不正确。
+
+##### 阻塞点 3：LPI 分配的全局性
+
+- x86 的 vector 是 **per-CPU** 的（每 CPU 256 个），分配局部、无竞争
+- ARM64 的 LPI 是 **全局共享池**（8192+ 范围），`its_lpi_alloc()` 需要全局 bitmap 操作
+- 动态分配时每次新增 vector 都要做全局 LPI 分配，需确保与已有 LPI 分配状态一致
+
+### 6.3 解决进展
+
+| 时间 | x86 | ARM64 |
+|------|-----|-------|
+| 2022.11 | Gleixner 重构 MSI 核心框架，x86 天然适配，直接加 `MSI_FLAG_PCI_MSIX_ALLOC_DYN` | — |
+| 2022.12 | x86 动态 MSI-X 合入 v6.2 | — |
+| 2023.05 | VFIO PCI 动态分配 patch (Reinette) 合入 | ITS 仍使用旧的 pci-msi.c 分层 |
+| 2024.06 | — | Gleixner 开始 ITS MSI parent 重构 (`b5712bf89b4b` 等) |
+| 2025.05 | — | Marc Zyngier 修复 `msi_prepare()` 调用时机 + 删除 ugly hack (`7dd20bf2f010`) |
+| 至今 | — | 前置修复已合入，但 **`MSI_FLAG_PCI_MSIX_ALLOC_DYN` 尚未正式启用** |
+
+#### Marc Zyngier 的前置修复 Patch Series
+
+**标题**: [PATCH v2 0/5] genirq/msi: Fix device MSI prepare/alloc sequencing
+**日期**: 2025-05-13
+**已合入 commit**: `7dd20bf2f010`
+
+| # | Patch | 内容 |
+|---|-------|------|
+| 1 | Add .msi_teardown() callback | 作为 .msi_prepare() 的逆操作 |
+| 2 | ITS: Implement .msi_teardown() | ITS 级别实现 |
+| 3 | Move prepare() call to per-device allocation | 修复 msi_prepare() 调用时机 |
+| 4 | Engage .msi_teardown() on domain removal | domain 销毁时调用 teardown |
+| 5 | ITS: Use allocation size from the prepare call | 删除 ugly hack |
+
+#### Gleixner 与 Marc Zyngier 关于启用动态 MSI-X 的讨论 (2025-05)
+
+Gleixner 在 review patch 5/5 时提出：
+
+> FWIW, while looking at something related, it occured to me that with
+> this change you can enable MSI_FLAG_PCI_MSIX_ALLOC_DYN now on GIC ITS.
+
+Marc Zyngier 的疑问：
+
+> What is the endpoint driver allowed to expect in terms of continuity
+> of allocation in the IRQ space? If this is solely limited to MSI-X,
+> then the answer probably is "none whatsoever".
+>
+> Can any other MSI-like mechanism end-up with multiple allocations and
+> require extra alignment/contiguity guarantees in the hwirq space?
+
+Gleixner 的确认：
+
+> It's only relevant to MSI-X today. That's the only facility, which
+> actually provides an interface _if_ the underlying parent supports it.
+> MSI-X 不需要 hwirq 连续性，driver 只需管理 MSI descriptor index。
+
+**结论**：前置修复（msi_prepare 调用时机 + ugly hack 删除）已合入。
+技术上 GIC ITS 已具备启用 `MSI_FLAG_PCI_MSIX_ALLOC_DYN` 的条件，
+但 Marc Zyngier 尚未正式提交启用该 flag 的 patch。
+ITT 预分配策略的最终方案（预分配到 hwsize vs. 动态扩展）仍需明确。
+
+### 6.4 参考链接
+
+#### ITS msi_prepare 修复
+
+- Cover letter v2: https://lore.kernel.org/lkml/20250513163144.2215824-1-maz@kernel.org/
+- Patch 5/5 (删除 ugly hack): https://lore.kernel.org/lkml/20250513163144.2215824-6-maz@kernel.org/
+
+#### Gleixner 与 Marc 关于动态 MSI-X 的讨论
+
+- Gleixner 首次提出可启用: https://lore.kernel.org/lkml/8734d1iwcp.ffs@tglx/
+- Marc 的疑问: https://lore.kernel.org/lkml/86wmacewjr.wl-maz@kernel.org/
+- Gleixner 解释动态分配意义: https://lore.kernel.org/lkml/87zff8hk1x.ffs@tglx/
+- Marc 关于连续性保证的追问: https://lore.kernel.org/lkml/86v7pwekum.wl-maz@kernel.org/
+- Gleixner 确认仅 MSI-X 需要: https://lore.kernel.org/lkml/871psirnh1.ffs@tglx/
+
+#### ITS MSI parent 重构
+
+- Provide MSI parent infrastructure: commit `48f71d56e2b8`
+- Provide MSI parent for PCI/MSI[-X]: commit `b5712bf89b4b`
