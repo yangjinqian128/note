@@ -985,3 +985,47 @@ ITT 也会预分配到最大容量（如 2048 entries）。这在内存上可能
 - Patch 3/5 (move prepare to per-device): https://lore.kernel.org/lkml/20250513163144.2215824-4-maz@kernel.org/
 - Patch 4/5 (engage msi_teardown on removal): https://lore.kernel.org/lkml/20250513163144.2215824-5-maz@kernel.org/
 - Patch 5/5 (ITS remove ugly hack): https://lore.kernel.org/lkml/20250513163144.2215824-6-maz@kernel.org/
+
+---
+
+## 8. 回合策略：从主线适配到 OLK 内核
+
+### 8.1 核心架构差异
+
+| 方面 | 主线 (linux) | OLK (kernel) |
+|------|-------------|-------------|
+| ITS PCI MSI 层 | `irq-gic-its-msi-parent.c` (MSI parent 架构) | `irq-gic-v3-its-pci-msi.c` (旧分层架构) |
+| ITS domain 创建 | `msi_create_device_irq_domain()` per-device | `pci_msi_create_irq_domain()` 全局 |
+| PCI MSI domain ops | 通过 `its_init_dev_msi_info()` 动态设置 | 静态 `its_pci_msi_ops` |
+| MSI irq chip | `msi_lib` 通用 chip | 自定义 `its_msi_irq_chip` |
+| `MSI_FLAG_PCI_MSI_MASK_PARENT` | 有 (required) | 无 |
+| VFIO PCI 代码 | 使用 MSI parent `msi_domain_alloc_irq_at()` | 使用旧的 `VFIO_DEVICE_SET_IRQS` 扩展方式 |
+
+### 8.2 适配要点
+
+**Patch 1/5 (msi_teardown callback)**: 改 `include/linux/msi.h` 和 `kernel/irq/msi.c`，
+这两个文件架构相同，但 OLK 有 KABI 保护。需用 `#include <linux/kabi.h>` 的
+`KABI_REPLACE` / `KABI_RESERVE` 机制来安全地添加 `.msi_teardown` 和 `.alloc_data`。
+
+**Patch 2/5 (ITS msi_teardown)**: 主线改 `irq-gic-its-msi-parent.c`，
+OLK 没有 this file → 需要将 teardown 逻辑适配到旧架构：
+- 在 `irq-gic-v3-its-pci-msi.c` 的 `its_pci_msi_ops` 中增加 `.msi_teardown`
+- 在 `irq-gic-v3-its.c` 中增加 `its_msi_teardown()` 实现
+- 从 `its_irq_domain_free()` 中移除 per-IRQ 的设备拆除逻辑
+
+**Patch 3/5 (move prepare)**: 核心改动。需要：
+- 在 `msi_domain_template` 中增加 `alloc_info` 字段（KABI）
+- 在 `msi_create_device_irq_domain()` 中增加 `msi_domain_prepare_irqs()` 调用
+- 新增 `populate_alloc_info()` 替换 `__msi_domain_alloc_irqs()` 中的直接调用
+- 在 `msi_domain_info` 中增加 `alloc_data` 指针（KABI）
+
+**Patch 4/5 (engage teardown)**: 在 `msi_remove_device_irq_domain()` 中增加 teardown 调用。
+
+**Patch 5/5 (remove ugly hack)**: 主线改 `irq-gic-its-msi-parent.c`，
+OLK 没有 → 需要在 `irq-gic-v3-its-pci-msi.c` 的 `its_pci_msi_prepare()` 中删除相同的 hack。
+
+**启用 MSI_FLAG_PCI_MSIX_ALLOC_DYN**: 在 `irq-gic-v3-its-pci-msi.c` 的
+`its_pci_msi_domain_info.flags` 中加入 `MSI_FLAG_PCI_MSIX_ALLOC_DYN`。
+同时需要确认 VFIO PCI 的 `vfio_pci_core_enable()` 中已有 `pci_msix_can_alloc_dyn()` 检查
+（笔记中 patch 09/11），以及 VFIO 的 `vfio_msi_alloc_irq()` 和 NORESIZE 清除逻辑
+（patch 10/11 和 11/11）已在当前内核中存在。
