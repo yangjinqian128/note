@@ -6,10 +6,437 @@
 
 ## 目录
 
-1. [拓扑架构与初始化（Control Plane）](#一拓扑架构与初始化control-plane)
-2. [数据面深度剖析：发送数据包（TX Data Path）](#二数据面深度剖析发送数据包tx-data-path)
-3. [数据面深度剖析：接收数据包（RX Data Path）](#三数据面深度剖析接收数据包rx-data-path)
-4. [核心数据结构与内存共享（Vring 机制）](#四核心数据结构与内存共享vring-机制)
+1. [Virtio 概述：什么是 Virtio，为什么需要 Virtio](#一virtio-概述什么是-virtio为什么需要-virtio)
+2. [拓扑架构与初始化（Control Plane）](#二拓扑架构与初始化control-plane)
+3. [数据面深度剖析：发送数据包（TX Data Path）](#三数据面深度剖析发送数据包tx-data-path)
+4. [数据面深度剖析：接收数据包（RX Data Path）](#四数据面深度剖析接收数据包rx-data-path)
+5. [核心数据结构与内存共享（Vring 机制）](#五核心数据结构与内存共享vring-机制)
+
+---
+
+## 一、Virtio 概述
+
+### 1.1 背景：虚拟化的 I/O 性能困境
+
+在虚拟化环境中，一台物理服务器上运行着多个虚拟机（VM）。每个 VM 都有自己的操作系统（Guest OS），这些 Guest OS 需要访问网络、磁盘、显卡等硬件设备。然而，物理硬件只有一套，不能直接"分给"每个 VM 独占使用——这就需要**一个机制让多个 VM 能安全、高效地共享物理硬件**。
+
+历史上，解决这个问题有三条路径，它们代表了不同的性能/复杂度/安全性权衡：
+
+```
+                     虚拟化 I/O 的三种方案
+
+   模拟设备                   半虚拟化                   设备直通
+  (Emulation)          (Paravirtualization)       (Passthrough)
+      │                       │                       │
+  ┌───┴────┐            ┌─────┴─────┐           ┌─────┴─────┐
+  │  Guest  │            │    Guest   │           │   Guest   │
+  │ Drivers │            │  Drivers   │           │  Drivers  │
+  │  (真实   │            │  (virtio   │           │  (原生    │
+  │   硬件)  │            │   frontend)│           │   驱动)   │
+  └───┬────┘            └─────┬─────┘           └─────┬─────┘
+      │                       │                       │
+      ▼                       ▼                       ▼
+  每次 I/O              共享内存 + 通知           硬件直接分配
+  都要陷入 VMM          (virtqueue)              给 VM (SR-IOV)
+      │                       │                       │
+      ▼                       ▼                       ▼
+  QEMU 模拟             QEMU/vhost            绕过 Hypervisor
+  硬件行为              处理并转发                  │
+      │                       │                       │
+      ▼                       ▼                       ▼
+  真实硬件驱动           真实硬件驱动             真实硬件与 VF 直通
+```
+
+#### 方案一：模拟设备（Full Emulation）
+
+让 Hypervisor（如 QEMU）用软件模拟一个真实存在的硬件设备，比如模拟一个 Intel e1000 网卡。Guest OS 内部使用 e1000 的原生驱动，完全不知道自己在虚拟机里。
+
+- **优点**：Guest OS 无需任何修改，兼容性最好。
+- **缺点**：**性能极差**。Guest 每次 I/O 操作（读写 MMIO 寄存器、发送数据包）都会触发 **VM Exit**——CPU 从 Guest 模式切换到 Host 模式，由 Hypervisor 软件模拟该硬件的寄存器行为。一个简单的网卡收包可能涉及数十次 VM Exit，而每次 VM Exit 的开销在数百到数千个 CPU 周期。
+
+#### 方案二：半虚拟化 / 协作式 I/O（Paravirtualized I/O）——这就是 virtio 的方案
+
+Hypervisor 和 Guest OS 约定好一套**高效的自定义协议**，不走模拟真实硬件的路线。Guest OS 安装专门的 virtio 驱动，知道自己运行在虚拟机中，通过共享内存环形队列（virtqueue）与 Host 批量传递数据。只在必要时（如一批数据准备好了）才通过轻量通知机制（kick / interrupt）告知对方。
+
+- **优点**：**性能极高**，接近原生性能。减少了绝大多数 VM Exit，支持批量操作、通知抑制、零拷贝。
+- **缺点**：Guest OS 必须安装专门的 virtio 驱动（好在 Linux/Windows/FreeBSD 等主流 OS 早已内置）。
+
+#### 方案三：设备直通（Device Passthrough / SR-IOV / VFIO）
+
+将物理设备直接分配给某个 VM 独占使用，绕过 Hypervisor 的 I/O 处理栈。例如通过 SR-IOV 将一个物理网卡虚拟出多个 VF（Virtual Function），每个 VF 分配给一个 VM。
+
+- **优点**：**极致性能**，几乎完全等同于裸机。
+- **缺点**：**硬件依赖强**，不支持热迁移（或迁移非常复杂），VF 数量受限于硬件，不灵活。
+
+### 1.2 Virtio介绍
+
+网上有太多讲的好的文章，这里就不写了，直接看：
+
+https://blogs.oracle.com/linux/introduction-to-virtio
+
+https://www.openeuler.org/en/blog/yorifang/virtio-spec-overview.html
+
+### 1.3 Virtio-Net
+
+**virtio-net** 是 virtio 规范中 Device ID = 1 的网络设备类型。它定义了一套标准化的虚拟网络设备接口，使 VM 能够以接近原生的性能收发网络数据包。无论是 AWS、阿里云还是 GCP，云上 VM 看到的网卡几乎都是 virtio-net。它是 virtio 规范中 Feature 最多（60+ 个 Feature Bits）、性能优化路径最丰富的设备类型。
+
+下面通过 QEMU 的具体源码，展示 virtio-net 从设备创建到数据收发的完整过程。所有 QEMU 代码来自 `/home/code/qemu` 源码树。
+
+---
+
+#### 1.3.1 QEMU 命令行与设备创建
+
+启动一个带 virtio-net 的 VM 通常这样写：
+
+```
+qemu-system-x86_64 \
+  -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
+  -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56
+```
+
+`-device virtio-net-pci` 触发 QEMU 类型系统，调用链为 `virtio_net_pci_realize` → `virtio_net_device_realize`。PCI 层只是一个薄壳，核心逻辑在设备层：
+
+```c
+// hw/virtio/virtio-net-pci.c:48-63 — PCI 适配层：把设备名传下去，然后转入设备层
+static void virtio_net_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
+{
+    DeviceState *qdev = DEVICE(vpci_dev);
+    VirtIONetPCI *dev = VIRTIO_NET_PCI(vpci_dev);
+    DeviceState *vdev = DEVICE(&dev->vdev);
+
+    virtio_net_set_netclient_name(&dev->vdev, qdev->id,
+                                  object_get_typename(OBJECT(qdev)));
+    qdev_realize(vdev, BUS(&vpci_dev->bus), errp);  // → 进入 virtio_net_device_realize
+}
+```
+
+```c
+// hw/net/virtio-net.c:3867-4008 — 设备层 realize（精简关键步骤）
+static void virtio_net_device_realize(DeviceState *dev, Error **errp)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtIONet *n = VIRTIO_NET(dev);
+
+    // ① 设置 Host Feature Bits
+    if (n->net_conf.mtu)
+        n->host_features |= (1ULL << VIRTIO_NET_F_MTU);
+
+    // ② 初始化 virtio 基础设施，Device ID = VIRTIO_ID_NET (=1)
+    virtio_net_set_config_size(n, n->host_features);
+    virtio_init(vdev, VIRTIO_ID_NET, n->config_size);
+
+    // ③ 分配 VirtIONetQueue 数组（每个 queue pair 一个元素）
+    n->vqs = g_new0(VirtIONetQueue, n->max_queue_pairs);
+
+    // ④ 创建第一个 queue pair 的 RX + TX virtqueues（见下一小节）
+    virtio_net_add_queue(n, 0);
+
+    // ⑤ 创建控制 virtqueue，用于运行时配置（MAC/MQ/RSS/VLAN...）
+    n->ctrl_vq = virtio_add_queue(vdev, 64, virtio_net_handle_ctrl);
+
+    // ⑥ 创建 NetClientState，关联后端 tap 设备
+    n->nic = qemu_new_nic(&net_virtio_info, &n->nic_conf,
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, n);
+
+    // ⑦ 检测后端 vnet_hdr 能力
+    peer_test_vnet_hdr(n);
+    n->host_hdr_len = peer_has_vnet_hdr(n) ? sizeof(struct virtio_net_hdr) : 0;
+}
+```
+
+> **对应关系**：QEMU 侧 `VirtIONet` = 整个网卡设备，`VirtIONetQueue` = 一对 TX+RX virtqueue。Linux 内核侧 `struct virtnet_info` = 整个网卡，`struct send_queue` / `struct receive_queue` = 单个 TX/RX 队列。
+
+---
+
+#### 1.3.2 创建 virtqueue 并绑定 handler
+
+`virtio_net_add_queue` 是数据面的关键——它创建 RX 和 TX 两个 virtqueue，并为每个绑定**回调函数**。当 Guest kick 某个 virtqueue 时，QEMU 事件循环调用对应的 handler：
+
+```c
+// hw/net/virtio-net.c:2976-2999
+static void virtio_net_add_queue(VirtIONet *n, int index)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(n);
+
+    // RX virtqueue：Host 有数据需要发给 Guest 时触发
+    n->vqs[index].rx_vq = virtio_add_queue(vdev, n->net_conf.rx_queue_size,
+                                           virtio_net_handle_rx);
+
+    // TX virtqueue：Guest 有数据要发送时触发。两种处理模式：
+    if (n->net_conf.tx && !strcmp(n->net_conf.tx, "timer")) {
+        // timer 模式：用定时器合并多次 kick，延迟批量处理
+        n->vqs[index].tx_vq =
+            virtio_add_queue(vdev, n->net_conf.tx_queue_size,
+                             virtio_net_handle_tx_timer);
+        n->vqs[index].tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                              virtio_net_tx_timer,
+                                              &n->vqs[index]);
+    } else {
+        // bh 模式（默认）：用 QEMU bottom-half 机制批量处理
+        n->vqs[index].tx_vq =
+            virtio_add_queue(vdev, n->net_conf.tx_queue_size,
+                             virtio_net_handle_tx_bh);
+        n->vqs[index].tx_bh = qemu_bh_new_guarded(virtio_net_tx_bh,
+                                                  &n->vqs[index],
+                                                  &DEVICE(vdev)->mem_reentrancy_guard);
+    }
+    n->vqs[index].tx_waiting = 0;
+    n->vqs[index].n = n;
+}
+```
+
+`virtio_add_queue`（`hw/virtio/virtio.c:2552`）在 `vdev->vq[]` 数组中找一个空闲槽位，设置队列大小，将 `handle_output` 函数指针存入 `vq->handle_output`。之后，Guest kick 该 virtqueue 时就会触发这个 handler。
+
+至此，Guest 和 Host 之间有了三条 virtqueue 通道：
+
+```
+  Guest (Linux)                                Host (QEMU)
+ ┌────────────────────┐                   ┌──────────────────────────┐
+ │ send_queue.vq      │ ──── kick ──────▶ │ TX vq → handle_tx_bh     │
+ │ (output: G→H)      │                   │   → virtio_net_flush_tx  │
+ │                    │                   │   → qemu_sendv_packet    │
+ │ receive_queue.vq   │ ◀── kick+中断 ─── │ RX vq → handle_rx        │
+ │ (input: H→G)       │                   │   → virtio_net_receive   │
+ │                    │                   │                          │
+ │ cvq                │ ──── kick ──────▶ │ Ctrl vq → handle_ctrl    │
+ │ (control: G↔H)     │                   │   → MAC/MQ/RSS 控制     │
+ └────────────────────┘                   └──────────────────────────┘
+            │                                        │
+            └────── 共享内存 (VRing) ────────────────┘
+```
+
+---
+
+#### 1.3.3 演练一：Guest 发送一个网络包（TX Path）
+
+Guest 中的 `ping 8.8.8.8` 经过 Linux 协议栈，到达 virtio-net 驱动的 `ndo_start_xmit` 回调（即 `start_xmit`，`drivers/net/virtio_net.c:3330`）。Guest 驱动把 sk_buff 转换为 scatter-gather list，连同 virtio header（checksum offload / GSO 信息）写入 vring 的 Descriptor Table，然后在 Available Ring 中登记：
+
+```
+Guest 物理内存中的 Vring
+┌─────────────────────────────────────┐
+│ Descriptor Table                    │
+│  desc[0]: addr=0x1000_0000 len=20   │ ← virtio net header
+│           flags=F_NEXT, next=3      │
+│  desc[3]: addr=0x2000_0000 len=1500 │ ← 以太网帧数据
+│           flags=0                   │
+├─────────────────────────────────────┤
+│ Available Ring                      │
+│  avail->ring[idx%256] = 0           │ ← Guest 写入链头 desc[0]
+│  avail->idx++                       │
+├─────────────────────────────────────┤
+│ Used Ring（空，等待 Host 填写）       │
+└─────────────────────────────────────┘
+```
+
+之后 Guest 调用 `virtqueue_kick` → `virtqueue_notify`，通过写 PCI Queue Notify 寄存器（或 eventfd）通知 Host。这一步触发 VM Exit，QEMU 事件循环收到 kick 信号。
+
+**Host 侧**：QEMU 根据 kick 的 virtqueue 找到注册的 handler——假设是 bh 模式，调用 `virtio_net_handle_tx_bh`：
+
+```c
+// hw/net/virtio-net.c:2851-2875
+static void virtio_net_handle_tx_bh(VirtIODevice *vdev, VirtQueue *vq)
+{
+    VirtIONet *n = VIRTIO_NET(vdev);
+    VirtIONetQueue *q = &n->vqs[vq2q(virtio_get_queue_index(vq))];
+
+    if (unlikely((n->status & VIRTIO_NET_S_LINK_UP) == 0)) {
+        virtio_net_drop_tx_queue_data(vdev, vq);  // 链路 down，丢弃
+        return;
+    }
+    if (unlikely(q->tx_waiting))
+        return;                         // 已有待处理数据，避免重复调度
+    q->tx_waiting = 1;
+    virtio_queue_set_notification(vq, 0);  // 关闭通知，批量处理期间忽略新 kick
+    replay_bh_schedule_event(q->tx_bh);    // 调度 bottom-half：virtio_net_tx_bh
+}
+```
+
+BH 被调度后进入 `virtio_net_tx_bh` → `virtio_net_flush_tx`——这是 TX 数据面的核心，一个 `for(;;)` 循环逐包处理：
+
+```c
+// hw/net/virtio-net.c:2718-2812 — 精简展示核心逻辑
+static int32_t virtio_net_flush_tx(VirtIONetQueue *q)
+{
+    VirtIONet *n = q->n;
+    VirtIODevice *vdev = VIRTIO_DEVICE(n);
+    VirtQueueElement *elem;
+    int32_t num_packets = 0;
+
+    for (;;) {
+        // ① virtqueue_pop：从 avail ring 取出 Guest 提交的 buffer
+        //    返回 VirtQueueElement，内含 out_sg（scatter-gather 列表）
+        elem = virtqueue_pop(q->tx_vq, sizeof(VirtQueueElement));
+        if (!elem) break;  // 无更多待发送数据
+
+        // ② 处理字节序转换（如果需要）
+        if (n->needs_vnet_hdr_swap)
+            virtio_net_hdr_swap(vdev, &vhdr);
+
+        // ③ 裁剪 virtio header（如果后端不需要完整的 guest header）
+        if (n->host_hdr_len != n->guest_hdr_len) {
+            sg_num  = iov_copy(sg, ..., out_sg, out_num, 0, n->host_hdr_len);
+            sg_num += iov_copy(sg + sg_num, ..., out_sg, out_num,
+                               n->guest_hdr_len, -1);
+            out_num = sg_num;
+            out_sg = sg;
+        }
+
+        // ④ 发送到后端（tap / vhost-net）
+        ret = qemu_sendv_packet_async(qemu_get_subqueue(n->nic, queue_index),
+                                      out_sg, out_num, virtio_net_tx_complete);
+        if (ret == 0) {
+            // 后端暂时不可写，保持 elem 等待 tx_complete 回调
+            q->async_tx.elem = elem;
+            return -EBUSY;
+        }
+
+        // ⑤ 同步完成：写入 Used Ring + 注入中断通知 Guest 回收
+        virtqueue_push(q->tx_vq, elem, 0);
+        virtio_notify(vdev, q->tx_vq);
+        g_free(elem);
+
+        // ⑥ tx_burst 限制，防止饥饿
+        if (++num_packets >= n->tx_burst) break;
+    }
+    return num_packets;
+}
+```
+
+其中三个核心 virtqueue 操作的语义：
+
+| 操作 | 函数（`hw/virtio/virtio.c`） | 做了什么 |
+|------|---------------------------|---------|
+| **Pop** | `virtqueue_pop` (line 2024) | 从 avail ring 取出 Guest 提交的 buffer head，遍历描述符链，构建 `VirtQueueElement`（含 `out_sg` iovec 数组），递增 `last_avail_idx` |
+| **Push** | `virtqueue_push` (line 1216) | 调用 `virtqueue_fill`（写 `used->ring[id] = {id, len}`）+ `virtqueue_flush`（更新 `used->idx` 并加写屏障） |
+| **Notify** | `virtio_notify` (line 2724) | 检查通知抑制条件后，调用 `virtio_irq` → `virtio_notify_vector` → PCI bus `notify` 回调 → MSI-X 中断注入 |
+
+Guest 收到 MSI-X 中断后，在 NAPI poll 或下次 `start_xmit` 时调用 `virtqueue_get_buf` 从 Used Ring 取回已完成的 buffer，释放 sk_buff。
+
+**TX 路径全程**：
+```
+Guest: 协议栈 → start_xmit → xmit_skb → virtqueue_add_outbuf → virtqueue_kick
+                                                                       │
+                                                               [VM Exit]
+                                                                       │
+Host:   virtio_net_handle_tx_bh → virtio_net_tx_bh                    │
+          → virtio_net_flush_tx                                        │
+            → virtqueue_pop → qemu_sendv_packet_async(tap)             │
+            → virtqueue_push → virtio_notify(MSI-X) ◄─────────────────┘
+                                                                       │
+Guest:  virtqueue_get_buf → 释放 skb                                   │
+```
+
+---
+
+#### 1.3.4 演练二：外部网络包进入 Guest（RX Path）
+
+RX 是 TX 的镜像。关键前提：Guest 必须**预先**在 RX virtqueue 中放置空 buffer（通过 `try_fill_recv` → `virtqueue_add_inbuf`），否则 Host 无 buffer 可用只能丢包。
+
+**Host 侧**：QEMU 主事件循环检测到 tap fd 可读后：
+
+```
+tap_receive → qemu_deliver_packet → nc->info->receive → virtio_net_receive
+```
+
+```c
+// hw/net/virtio-net.c:2672-2680
+static ssize_t virtio_net_receive(NetClientState *nc, const uint8_t *buf,
+                                  size_t size)
+{
+    VirtIONet *n = qemu_get_nic_opaque(nc);
+    if ((n->rsc4_enabled || n->rsc6_enabled))
+        return virtio_net_rsc_receive(nc, buf, size);   // RSC 合并小包
+    else
+        return virtio_net_do_receive(nc, buf, size);    // 正常路径
+}
+```
+
+核心在 `virtio_net_receive_rcu`（`hw/net/virtio-net.c:1904`），精简逻辑如下：
+
+```c
+// ① RSS 选队列
+if (n->rss_data.enabled && n->rss_data.enabled_software_rss) {
+    int index = virtio_net_process_rss(nc, buf, size, &extra_hdr);
+    if (index >= 0)
+        nc = qemu_get_subqueue(n->nic, index % n->curr_queue_pairs);
+}
+
+// ② 检查有空 buffer 才处理，否则丢包
+if (!virtio_net_has_buffers(q, size + n->guest_hdr_len - n->host_hdr_len))
+    return 0;
+
+// ③ 循环 pop 空 buffer → 拷贝数据
+while (offset < size) {
+    elem = virtqueue_pop(q->rx_vq, sizeof(VirtQueueElement));
+    // 第一个 sg entry 填入 virtio header (num_buffers 等)
+    if (i == 0) {
+        receive_header(n, sg, elem->in_num, buf, size);
+        offset = n->host_hdr_len;
+    }
+    // 数据拷贝到 Guest 内存 (GPA)
+    len = iov_from_buf(sg, elem->in_num, guest_offset,
+                       buf + offset, size - offset);
+    offset += len;
+    elems[i] = elem;
+    i++;
+}
+
+// ④ 批量写入 Used Ring：fill 逐个写，flush 更新 used->idx + 写屏障
+for (j = 0; j < i; j++)
+    virtqueue_fill(q->rx_vq, elems[j], lens[j], j);
+virtqueue_flush(q->rx_vq, i);
+
+// ⑤ 注入 MSI-X 中断通知 Guest
+virtio_notify(vdev, q->rx_vq);
+```
+
+**Guest 侧**：收到中断 → `napi_schedule(&rq->napi)` → ksoftirqd 调用 `virtnet_poll` → `virtnet_receive` → `receive_buf` → `napi_gro_receive` → `netif_receive_skb`，进入 Linux 协议栈。之后 `try_fill_recv` 向 RX virtqueue 补充新的空 buffer。
+
+**RX 路径全程**：
+```
+Host:  tap fd 可读 → virtio_net_receive → virtio_net_receive_rcu
+         → virtqueue_pop (取 Guest 预置空 buffer)
+         → iov_from_buf (拷贝数据到 Guest 内存)
+         → virtqueue_flush + virtio_notify (写 used ring + MSI-X 中断)
+
+Guest: 收中断 → napi_schedule → virtnet_poll → virtnet_receive
+         → virtqueue_get_buf → receive_buf → netif_receive_skb
+         → try_fill_recv (补充空 buffer) → virtqueue_kick
+```
+
+---
+
+#### 1.3.5 通用模式总结
+
+从 TX 和 RX 两次演练中，可以抽象出 virtio 数据面的通用生产者-消费者模型：
+
+```
+ 生产者                          消费者
+ ┌──────────────────┐           ┌──────────────────┐
+ │ 1. 准备数据       │           │ 3. pop 取出描述符  │
+ │ 2. add 到 vring  │           │ 4. 处理数据       │
+ │ 3. kick 通知对方  │ ───────▶ │ 5. push 回 used   │
+ │                  │           │ 6. notify 通知对方 │
+ │ 7. 收到中断       │ ◀─────── │                   │
+ │ 8. get_buf 回收   │           │                   │
+ └──────────────────┘           └──────────────────┘
+```
+
+核心原则：**共享内存传递数据（零拷贝），轻量通知传递事件**。整个过程中网络包数据本身只在外部分配的 buffer 中存储一次，描述符和 ring 索引围绕 buffer 的 GPA 地址流转。
+
+---
+
+#### 1.3.6 本文档的组织结构
+
+有了以上 virtio 基础知识后，本文档的后续章节将逐层深入 virtio-net 的内核与 QEMU 源码实现：
+
+| 章节 | 内容 | 核心问题 |
+|------|------|---------|
+| [第二章](#二拓扑架构与初始化control-plane) | 控制面：驱动注册、设备创建、Feature 协商、virtqueue 初始化 | virtio-net 设备是怎么建立的？Guest 和 Host 如何握手？ |
+| [第三章](#三数据面深度剖析发送数据包tx-data-path) | TX 数据路径：从 Linux `ndo_start_xmit` 到 QEMU tap 写入 | VM 发出的网络包经过了哪些函数？零拷贝如何实现？ |
+| [第四章](#四数据面深度剖析接收数据包rx-data-path) | RX 数据路径：从 tap 可读到 Guest 协议栈 `netif_receive_skb` | 外部网络包如何进入 VM？NAPI、XDP、GRO 如何介入？ |
+| [第五章](#五核心数据结构与内存共享vring-机制) | Vring 数据结构详解：Split Ring vs Packed Ring，内存屏障，零拷贝机制 | virtqueue 共享内存到底长什么样？所有权如何转移？ |
 
 ---
 
@@ -28,7 +455,7 @@
 
 ---
 
-## 一、拓扑架构与初始化（Control Plane）
+## 二、拓扑架构与初始化（Control Plane）
 
 ### 1.1 Guest 端（Linux）驱动注册：**virtnet_probe**
 
@@ -363,7 +790,7 @@ typedef struct VirtIONetQueue {
 
 ---
 
-## 二、数据面深度剖析：发送数据包（TX Data Path）
+## 三、数据面深度剖析：发送数据包（TX Data Path）
 
 ### 2.1 核心调用流程图
 
@@ -562,7 +989,7 @@ drop:
 
 ---
 
-## 三、数据面深度剖析：接收数据包（RX Data Path）
+## 四、数据面深度剖析：接收数据包（RX Data Path）
 
 ### 3.1 核心调用流程图
 
@@ -853,7 +1280,7 @@ err = virtnet_rq_submit(rq, buf, len, ctx, gfp);
 
 ---
 
-## 四、核心数据结构与内存共享（Vring 机制）
+## 五、核心数据结构与内存共享（Vring 机制）
 
 ### 4.1 Split Ring vs Packed Ring 对比
 
