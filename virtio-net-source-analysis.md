@@ -89,7 +89,7 @@ https://www.openeuler.org/en/blog/yorifang/virtio-spec-overview.html
 启动一个带 virtio-net 的 VM 通常这样写：
 
 ```
-qemu-system-x86_64 \
+qemu-system-aarch64 \
   -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
   -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56
 ```
@@ -208,7 +208,7 @@ static void virtio_net_add_queue(VirtIONet *n, int index)
 
 ---
 
-#### 1.3.3 演练一：Guest 发送一个网络包（TX Path）
+#### 1.3.3 Guest 发送一个网络包（TX Path）
 
 Guest 中的 `ping 8.8.8.8` 经过 Linux 协议栈，到达 virtio-net 驱动的 `ndo_start_xmit` 回调（即 `start_xmit`，`drivers/net/virtio_net.c:3330`）。Guest 驱动把 sk_buff 转换为 scatter-gather list，连同 virtio header（checksum offload / GSO 信息）写入 vring 的 Descriptor Table，然后在 Available Ring 中登记：
 
@@ -329,7 +329,7 @@ Guest:  virtqueue_get_buf → 释放 skb                                   │
 
 ---
 
-#### 1.3.4 演练二：外部网络包进入 Guest（RX Path）
+#### 1.3.4 外部网络包进入 Guest（RX Path）
 
 RX 是 TX 的镜像。关键前提：Guest 必须**预先**在 RX virtqueue 中放置空 buffer（通过 `try_fill_recv` → `virtqueue_add_inbuf`），否则 Host 无 buffer 可用只能丢包。
 
