@@ -1,15 +1,18 @@
 # ARM64 KVM-QEMU 寄存器虚拟化详解
 
-本文档详细介绍 ARM64 架构下 KVM-QEMU 的寄存器虚拟化机制，包括数据结构、初始化流程和修改流程。
+本文档详细介绍 ARM64 架构下 KVM 的寄存器虚拟化机制，
+包括寄存器 ID 编码、数据结构、初始化流程、QEMU 用户空间读写、以及 guest
+运行时的 trap 与不 trap 两种访问路径。
 
 ## 目录
 
-1. [寄存器 ID 编码](#1-寄存器-id-编码)
+1. [KVM 寄存器 ID 编码](#1-kvm-寄存器-id-编码)
 2. [数据结构](#2-数据结构)
 3. [寄存器初始化流程](#3-寄存器初始化流程)
-4. [寄存器同步流程](#4-寄存器同步流程)
-5. [寄存器修改流程](#5-寄存器修改流程)
-6. [关键代码路径](#6-关键代码路径)
+4. [寄存器读写接口 (ioctl)](#4-寄存器读写接口ioctl)
+5. [Guest 读写寄存器的两种路径](#5-guest-读写寄存器的两种路径)
+
+相关文档：[Guest 系统寄存器 trap 全路径详解](arm64_kvm_guest_trap_path.md)
 
 ---
 
@@ -167,11 +170,10 @@ struct kvm_cpu_context {
     struct kvm_vcpu *__hyp_running_vcpu;
 };
 
+```
 这里命名 kvm_cpu_context 上下文是因为，host切到guest，kvm会保存host的寄存器信息，恢复
 guest的寄存器信息；在guest切换会host时再恢复host的寄存器信息，保存guest的寄存器信息。
 因此这些寄存器信息就是上下文信息。
-
-```
 
 sys_regs[] 的 idx 的 寄存器语义定义在：`arch/arm64/include/asm/kvm_host.h:338`
 ```
@@ -1274,11 +1276,3 @@ static void perform_access(struct kvm_vcpu *vcpu, struct sys_reg_params *params,
 - 通用寄存器 / 不 trap 的系统寄存器：0 额外 cycle（硬件原生执行）
 - trap 的系统寄存器：一次 VM exit + 处理 + VM entry，~几百到上千 cycle
 
-
-ARM64 KVM-QEMU 寄存器虚拟化的核心要点：
-
-1. **统一的寄存器 ID 编码**：KVM 通过标准化的 64 位 ID 标识所有寄存器
-2. **分层的数据结构**：内核使用 `kvm_vcpu_arch` → `kvm_cpu_context` 存储寄存器
-3. **初始化流程**：`kvm_reset_vcpu()` 遍历寄存器描述表设置初始值
-4. **同步机制**：QEMU 通过 cpreg 列表作为中间层同步系统寄存器
-5. **ioctl 接口**：`KVM_SET_ONE_REG/KVM_GET_ONE_REG` 是用户空间修改寄存器的唯一入口

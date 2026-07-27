@@ -1029,3 +1029,138 @@ OLK 没有 → 需要在 `irq-gic-v3-its-pci-msi.c` 的 `its_pci_msi_prepare()` 
 同时需要确认 VFIO PCI 的 `vfio_pci_core_enable()` 中已有 `pci_msix_can_alloc_dyn()` 检查
 （笔记中 patch 09/11），以及 VFIO 的 `vfio_msi_alloc_irq()` 和 NORESIZE 清除逻辑
 （patch 10/11 和 11/11）已在当前内核中存在。
+
+---
+
+## 9. Marc's series 合入前后对比：为什么之前不能动态分配
+
+### 9.1 之前（Marc's series 合入前）
+
+#### msi_prepare 每次分配都被调用，nvec 不确定
+
+```
+pci_alloc_irq_vectors(nvec=1)          // 第一次，只分配 1 个
+  → __msi_domain_alloc_irqs(nirqs=1)
+       → msi_domain_prepare_irqs(domain, dev, nvec=1, &arg)   // ← 每次分配都调！
+            → its_pci_msi_prepare(nvec=1)
+                 ↓
+                 // ugly hack:
+                 if (msi_info->hwsize > nvec)   // hwsize=2048, nvec=1
+                     nvec = msi_info->hwsize;   // 强制改成 2048
+                 ↓
+                 its_create_device(dev_id, nvec=2048)
+                   → ITT = 2048 entries
+                   → LPI pool = 2048
+```
+
+每次分配中断都走一遍 `msi_prepare`。ITS 靠 ugly hack 强行把 nvec 拉到 hwsize，
+保证 ITT 够大。prepare 被反复调用，但 `its_find_device` 发现设备已存在就标记
+`shared=true` 跳过创建——**靠巧合没崩，语义是错误的**。
+
+#### 释放：per-IRQ free 里不对称拆除
+
+```
+pci_free_irq_vectors()
+  → its_irq_domain_free()              // 每次释放一个 IRQ
+       if (全部 LPI 已释放 && !shared)
+           its_lpi_free()               // ← 在 per-IRQ 层面拆设备
+           its_send_mapd(0)
+           its_free_device()
+```
+
+创建在 `msi_prepare`（per-allocation），拆除在 `its_irq_domain_free`（per-IRQ），
+**生命周期不对称**。
+
+#### 为什么动态分配不可行
+
+`pci_msix_alloc_irq_at()` → `msi_domain_alloc_irq_at()` → `__msi_domain_alloc_irqs(1)`
+→ `msi_prepare(nvec=1)`。每次动态分配一个 vector，prepare 都被触发。
+ugly hack 虽能保证 ITT 够大，但 prepare 的语义是"为设备准备 MSI 环境"，
+不该每次加一个 vector 都执行一遍。**没有 alloc_data 快照机制，prepare 路径绕不开。**
+
+### 9.2 之后（Marc's series 合入后）
+
+#### msi_prepare 只在 domain 创建时调用一次，传 hwsize
+
+```
+pci_enable_msix_range() → pci_setup_msix_device_domain(hwsize=2048)
+  → msi_create_device_irq_domain(hwsize=2048)
+       ↓
+       bundle->info.hwsize = hwsize;                    // 2048
+       bundle->info.alloc_data = &bundle->alloc_info;   // 指向快照存储位置
+       ↓
+       msi_domain_prepare_irqs(domain, dev, hwsize=2048, &bundle->alloc_info)
+            → its_pci_msi_prepare(nvec=2048)
+                 // ugly hack 已删除，nvec 本来就是 hwsize
+                 its_create_device(dev_id, nvec=2048)
+                   → ITT = 2048 entries
+                   → LPI pool = 2048
+            → alloc_info 填充完毕，snapshot 完成
+```
+
+#### 动态分配时：populate_alloc_info 拷贝快照，不调 prepare
+
+```
+pci_msix_alloc_irq_at(vector=5)
+  → msi_domain_alloc_irq_at(index=5)
+       → __msi_domain_alloc_irqs(nirqs=1)
+            ↓
+            populate_alloc_info(domain, dev, nirqs=1, &arg)
+              // info->alloc_data 已在 domain 创建时设置 (bundle->info.alloc_data)
+              // 非空 → 走快照拷贝，不调 msi_prepare
+              *arg = *info->alloc_data;
+            ↓
+            // arg.scratchpad[0].ptr = its_dev（已创建好的设备指针）
+            // prepare_desc: 填充 MSI-X table entry（message address/data）
+            // set_desc: 在 its_dev->event_map 中找空闲 EventID，分配 LPI，写 ITT entry
+```
+
+`alloc_info` 是 `msi_alloc_info_t` 结构体（`include/asm-generic/msi.h:24`）：
+
+```c
+typedef struct msi_alloc_info {
+    struct msi_desc   *desc;
+    irq_hw_number_t    hwirq;
+    unsigned long      flags;
+    union {
+        unsigned long  ul;
+        void          *ptr;
+    } scratchpad[NUM_MSI_ALLOC_SCRATCHPAD_REGS];  // ARM64 上 = 2
+} msi_alloc_info_t;
+```
+
+ITS prepare 前后 scratchpad 内容变化：
+
+| 字段 | prepare 前（domain 创建时传入） | prepare 后（被 ITS 内部 `its_msi_prepare` 填充） |
+|---|---|---|
+| `scratchpad[0]` | `ul`: DeviceID — 从 PCI RID 换算的 ITS 设备号 | `ptr`: `its_device *` — 已分配好 ITT + LPI 池的设备结构体 |
+| `scratchpad[1]` | `ul`: GICv5 translate frame 物理地址（仅 GICv5 用） | 不变 |
+| `hwsize`（在 `info->hwsize`，不在 scratchpad 内） | MSI-X Table Size（如 2048） | 不变 |
+
+**关键设计：同一个 `scratchpad[0]`，prepare 前是 `ul`（查询键——DeviceID），
+prepare 后被 ITS 覆盖为 `ptr`（查询结果——`its_device *`）。**
+动态分配时拷贝快照，拿到的就是结果，无需再查 ITS 硬件。
+
+#### 释放：teardown 在 domain 移除时对称调用
+
+```
+pci_disable_msix()
+  → msi_remove_device_irq_domain()
+       → info->ops->msi_teardown(domain, info->alloc_data)
+            → its_send_mapd(its_dev, 0)
+            → its_free_device(its_dev)
+```
+
+`msi_teardown` 作为 `msi_prepare` 的逆操作，在 domain 销毁时成对调用，
+**生命周期对称**。
+
+### 9.3 对比总结
+
+| | Before | After |
+|---|---|---|
+| prepare 调用时机 | 每次 IRQ 分配都调 | domain 创建时调一次 |
+| prepare 拿到的 nvec | 当前 nirqs（可能为 1），靠 ugly hack 拉到 hwsize | 就是 hwsize，正确值自带 |
+| ugly hack | 必须有（`if (hwsize > nvec) nvec = hwsize`） | 已删除 |
+| 动态分配路径 | 不存在（prepare 被反复触发，语义不对） | `populate_alloc_info` 拷贝快照，prepare 不走 |
+| teardown | per-IRQ free 里不对称拆除 | domain 移除时与 prepare 对称调用 |
+| alloc_data 快照机制 | 无 | 有：domain 创建时 snapshot，动态分配时复用 |
