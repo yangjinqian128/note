@@ -736,8 +736,8 @@ static void gicv5_ppi_irq_eoi(struct irq_data *d)
 Step 1-2: 与物理 LPI 相同（MSI → ITS 翻译）
 
 Step 2b: ITS 查 ITTE 时发现 VIRTUAL=1
-  输出: { LPI_INTID, Event, VM_ID }
-  → 发送给 IRS，标记为虚拟中断
+  输出: { LPI_INTID, phys/virt, Event, VM_ID, Domain }
+  → 发送给 IRS
 
 Step 3: IRS 收到虚拟中断事件
   查 VM Table[VM_ID]
@@ -751,8 +751,7 @@ Step 4: IRS 查 Virtual LPI IST
 
 Step 5a: VPE 在线（resident）
   查 VPE Table[VPE_ID] → VPETE
-  → 该 VPE 当前被哪个 PE 承载？（通过 ICH_CONTEXTR_EL2）
-  → 向该 PE 的 Virtual CPU-IF 转发候选 vHPPI
+  → PE 当前被哪个 VPE 占用？（通过 ICH_CONTEXTR_EL2）
 
 Step 5b: VPE 不在线
   if (Hypervisor 请求了 Doorbell):
