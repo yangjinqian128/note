@@ -761,6 +761,9 @@ Step 5b: VPE 不在线
     → 中断保持 pending，等待 VPE 变为 resident
 ```
 
+![alt text](images/image-9.png)
+
+
 **VPE residency 控制**：
 
 ```c
