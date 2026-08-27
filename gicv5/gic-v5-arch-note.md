@@ -13,6 +13,44 @@ GICv5 由四种硬件组件构成：
 
 ![alt text](images/image.png)
 
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                        GICv5 Hardware & Memory Structure                                            │
+│                                                                                                                      │
+│ ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ╔═══════════════════════════════════════════════════════╗ │
+│ │      PE 0      │  │      PE 1      │  │      PE N-1    │  ║ Memory (software-allocated tables)                   ║ │
+│ │ ┌────────────┐ │  │ ┌────────────┐ │  │ ┌────────────┐ │  ║                                                     ║ │
+│ │ │ CPU-IF     │ │  │ │ CPU-IF     │ │  │ │ CPU-IF     │ │  ║ ┌───────────────────────┐ ┌───────────────────────┐ ║ │
+│ │ │ ICC/ICV    │ │  │ │ ICC/ICV    │ │  │ │ ICC/ICV    │ │  ║ │  Physical LPI IST     │ │  VM Table             │ ║ │
+│ │ │ HPPI arb   │ │  │ │ HPPI arb   │ │  │ │ HPPI arb   │ │  ║ │  <- IRS R/W           │ │  L2_VMTE[VM_ID]       │ ║ │
+│ │ └─────┬──────┘ │  │ └─────┬──────┘ │  │ └─────┬──────┘ │  ║ └───────────────────────┘ └───────────────────────┘ ║ │
+│ └───────┼────────┘  └───────┼────────┘  └───────┼────────┘  ║                                                     ║ │
+│         │                    │                    │          ║ ┌───────────────────────┐ ┌───────────────────────┐ ║ │
+│         └───────────────────┴───────────────────┴          ║ │  VPE Table (per VM)   │ │  VPE Descriptor       │ ║ │
+│           IRI Link (GICv5 Stream Protocol)                 ║ │  VPETE[] -> VPE Desc  │ │  (per VPE, IRS work)  │ ║ │
+│                             │                              ║ └───────────────────────┘ └───────────────────────┘ ║ │
+│                             │                              ║                                                     ║ │
+│   ┌───────────────────────────────────────────────┐       ║ ┌───────────────────────┐ ┌───────────────────────┐ ║ │
+│   │ IRS: SPI state & routing, HPPI, residency    │──────►║ │  vLPI IST (per VM)    │ │  vSPI IST (per VM)    │ ║ │
+│   │ VPE residency, doorbell eval, VM/VPE mgmt    │       ║ │  En/Pr/Pend/Rtg(VPE)  │ │  <- IRS R/W           │ ║ │
+│   └───────┬───────────────────┬─────────────────────┘       ║ └───────────────────────┘ └───────────────────────┘ ║ │
+│           │                   │                             ║                                                     ║ │
+│  ┌──────────────┐  ┌───────────────────────┐                ║ ┌───────────────────────┐ ┌───────────────────────┐ ║ │
+│  │ SPI-wired     │  │ ITS: DT/ITT lookup     │──────────────►║ │  ITS DT (per ITS)     │ │  ITT xN (per device)  │ ║ │
+│  │ (direct wire) │  │                       │                ║ │  DTE[]  <- ITS R/W    │ │  ITTE[] -> LPI INTID  │ ║ │
+│  └──────────────┘  └───────────┬───────────┘                ║ └───────────────────────┘ └───────────────────────┘ ║ │
+│                                │                            ║                                                     ║ │
+│                    ┌─────────────┐  MSI write               ║                                                     ║ │
+│                    │ wire->event │  PCIe endpoint           ║                                                     ║ │
+│                    └──────┬──────┘                          ║                                                     ║ │
+│                           │                                 ║                                                     ║ │
+│                      wired device                          ║                                                     ║ │
+│                                                            ╚═══════════════════════════════════════════════════════╝ │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+> 图注：IRS/ITS/IWB 各画一个为代表（实际可多个）；doorbell LPI 是普通物理 LPI，经物理 IST + IRI Link 投递；表的基地址由软件写入 IRS_*_BASER / ITS_DT_BASER 后硬件接管。
+
 | 组件 | 一句话职责 | 输入 | 输出 |
 |------|-----------|------|------|
 | **IWB** | 将有线电平/边沿信号转换为 ITS 事件 | 物理 wire 断言 | `(DeviceID=本IWB, EventID=wire编号, Event=SET_EDGE/SET_LEVEL/CLEAR)` |
@@ -581,6 +619,8 @@ static struct irq_chip gicv5_lpi_irq_chip = {
 
 ### 2.2 SPI 路径
 
+![alt text](images/image-10.png)
+
 SPI 是有线中断，**始终直连到 IRS**，不需要 IWB 和 ITS。关键特征：
 
 - **INTID 与 wire 固定绑定**：不像 LPI 可以软件控制映射关系，SPI 的 INTID 始终对应特定的输入 wire
@@ -627,45 +667,11 @@ Step D: 之后使用 GIC 系统指令
   GIC CDEN  → 使能
 ```
 
-**内核中的 SPI 路由代码（`gicv5_iri_irq_set_affinity`）**：
-
-```c
-// drivers/irqchip/irq-gic-v5.c:232
-static int gicv5_iri_irq_set_affinity(struct irq_data *d,
-                                       const struct cpumask *mask_val,
-                                       bool force, u32 hwirq_type)
-{
-    int cpu;
-    u16 iaffid;
-    u64 cdaff;
-
-    // 选目标 CPU
-    if (force)
-        cpu = cpumask_first(mask_val);
-    else
-        cpu = cpumask_any_and(mask_val, cpu_online_mask);
-
-    // CPU → IAFFID
-    if (gicv5_irs_cpu_to_iaffid(cpu, &iaffid))
-        return -ENODEV;
-
-    // 构造 CDAFF 操作数
-    cdaff = GICV5_IAFFID(iaffid) |
-            GICV5_HWIRQ_SET_TYPE(hwirq_type) |
-            GICV5_HWIRQ_SET_ID(d->hwirq);
-
-    // 执行 CDAFF 指令
-    gic_insn(cdaff, CDAFF);
-
-    // 更新内核的有效 affinity
-    irq_data_update_effective_affinity(d, cpumask_of(cpu));
-    return IRQ_SET_MASK_OK;
-}
-```
-
 ---
 
 ### 2.3 PPI 路径
+
+![alt text](images/image-11.png)
 
 PPI 是 PE 本地事件，**直接在 CPU-IF 内处理，完全不走 IRI（without recourse to the IRI）**。PPI 不需要路由信息——目的地永远是本地 PE。
 
@@ -688,45 +694,15 @@ PPI 直接参与 CPU-IF 的 HPPI 选择
   → 拉 IRQ/FIQ
 ```
 
-**PPI 操作全部走系统寄存器**：
-
-```c
-// PPI Enable — drivers/irqchip/irq-gic-v5.c:112
-static void gicv5_ppi_irq_mask(struct irq_data *d)
-{
-    u64 hwirq_id_bit = BIT_ULL(d->hwirq % 64);
-    if (d->hwirq < 64)
-        sysreg_clear_set_s(SYS_ICC_PPI_ENABLER0_EL1, hwirq_id_bit, 0);
-    else
-        sysreg_clear_set_s(SYS_ICC_PPI_ENABLER1_EL1, hwirq_id_bit, 0);
-    isb();  // PPI 不进 IRI，ISB 足够
-}
-
-static void gicv5_ppi_irq_unmask(struct irq_data *d)
-{
-    u64 hwirq_id_bit = BIT_ULL(d->hwirq % 64);
-    if (d->hwirq < 64)
-        sysreg_clear_set_s(SYS_ICC_PPI_ENABLER0_EL1, 0, hwirq_id_bit);
-    else
-        sysreg_clear_set_s(SYS_ICC_PPI_ENABLER1_EL1, 0, hwirq_id_bit);
-    isb();  // 确保有限时间内生效
-}
-
-// PPI EOI — 但使用 GIC 系统指令 CDDI
-static void gicv5_ppi_irq_eoi(struct irq_data *d)
-{
-    if (irqd_is_forwarded_to_vcpu(d))
-        return;  // 转发给 VCPU 的跳过
-    gicv5_hwirq_eoi(d->hwirq, GICV5_HWIRQ_TYPE_PPI);
-    // → gic_insn(cddi, CDDI)
-}
-```
+CPU interface 在 PE 内部（核心内、CPU die 上），以 FEAT_GCIE 架构特性的形式存在，PPI 操作全部走系统寄存器。
 
 **每个 PE 的 PPI 命名空间独立**：PE0 的 PPI #9（Generic Timer）和 PE1 的 PPI #9 是完全独立的中断。
 
 ---
 
 ### 2.4 vLPI 路径
+
+![alt text](images/image-13.png)
 
 物理 LPI 直接注入到 VM 需要 ITS 翻译出 VIRTUAL=1 的 ITTE。
 
@@ -751,31 +727,28 @@ Step 4: IRS 查 Virtual LPI IST
 
 Step 5a: VPE 在线（resident）
   查 VPE Table[VPE_ID] → VPETE
-  → PE 当前被哪个 VPE 占用？（通过 ICH_CONTEXTR_EL2）
+  → vPE 当前在哪个 PE 上（通过 VPE Descriptor）
 
 Step 5b: VPE 不在线
-  if (Hypervisor 请求了 Doorbell):
-    → 触发 VPE Doorbell LPI（通知 Hypervisor 调度该 VPE）
+  门铃条件（全部满足才触发，规范 §4.10.7 RCWZMW）:
+    ① VPE 不在任何 PE 上（本分支已满足）
+    ② 门铃设置有效（创建后经 IRS_VPE_SELR 写过 IRS_VPE_DBR）
+    ③ 请求过门铃（ICH_CONTEXTR_EL2.DB 或 IRS_VPE_DBR.REQ_DB=1）
+    ④ 有 Targeted 虚拟中断 Pending+Inactive+Enabled
+       （或 1ofN 门铃条件满足）
+    ⑤ 该中断优先级 ≥ DBPM 阈值 ★
+       （重要性比较；数值上 ≤ DBPM —— GIC 数值越小优先级越高。
+         DBPM 由 Hypervisor 按 Guest 的 Running Priority 与
+         Priority Mask 计算，低于阈值的低优先级中断不唤醒 VPE）
+  if (门铃条件全部满足):
+    → 对 Doorbell LPI（普通物理 LPI）生成 SET_EDGE 事件
+    → 走普通物理 LPI 投递（自身 affinity 路由到 Hypervisor）
+    → REQ_DB 硬件自动清零 —— 每个 non-resident 周期只响一次
   else:
     → 中断保持 pending，等待 VPE 变为 resident
 ```
 
 ![alt text](images/image-9.png)
-
-
-**VPE residency 控制**：
-
-```c
-// Hypervisor 切换 VPE 时的操作
-// 清除旧 VPE
-MSR ICH_CONTEXTR_EL2, xzr   // V=0, 当前 VPE non-resident
-ISB
-
-// 设置新 VPE
-MSR ICH_CONTEXTR_EL2, x5     // V=1, VM=x5.VM, VPE=x5.VPE
-                              // DB=x5.DB (是否请求 doorbell)
-ISB
-```
 
 **Doorbell 机制**：
 - 每个 VPE 分配一个物理 LPI 作为 doorbell 中断
@@ -785,6 +758,8 @@ ISB
 ---
 
 ### 2.5 vSPI 路径
+
+![alt text](images/image-14.png)
 
 vSPI 有两条路线：
 
@@ -820,36 +795,66 @@ Hypervisor 执行:
 
 ### 2.6 vPPI 路径
 
-vPPI 通过 DVI（Direct Virtual Injection）实现硬件级别的直接映射：
+vPPI 的直通机制是 DVI（Direct Virtual Injection）：每个物理 PPI 有同号的 vPPI（同 PE），DVI=1 时物理 PPI 的 pending 被硬件实时镜像到 vPPI pending：
 
 ```
-物理 PPI 信号
-  │
-  ├→ 物理域 PPI pending（如果未禁止物理 PPI）
-  │
-  └→ ICH_PPI_DVIR[n].DVI == 1 ？
-       │
-       YES → 对应 vPPI pending 同步置位
-             Guest 在 Virtual Domain 中直接看到 vPPI
-             无需 Hypervisor 介入
-
-Hypervisor 应在启用 DVI 后禁用物理 PPI，
-避免物理和虚拟 handler 同时响应：
-  ICC_PPI_ENABLER 清对应 bit + ISB
+物理 PPI #27 (Timer) pending
+  └→ ICH_PPI_DVIR0_EL2.bit27 == 1 ？
+       YES → vPPI #27 pending 同步镜像
+             Guest 在 Virtual Domain 直接处理，零 Hypervisor 介入
 ```
 
-**DVI 配置**：
+要点：
+
+- DVI 只镜像 **pending 一位**：enable/priority/active 各归各，Guest 用自己的 `ICV_PPI_*` 配置虚拟侧；两侧是独立中断、各自应答，Hypervisor 约定禁用物理侧（`ICC_PPI_ENABLER` 清位 + ISB）
+- vPPI 状态存 PE 虚拟寄存器（Guest 视角 `ICV_PPI_*_EL1` / Hypervisor 视角 `ICH_PPI_*_EL2`），**每进出 Guest 保存/恢复**（switch.c:117/132）
+- DVI 是**边界动态开关**：进入时全量写位图开 DVI，退出时读回状态后立即清零（不剪断直连线，物理 PPI 会误打到下一个 VPE 上下文）
 
 ```c
-// Hypervisor 设置 DVI
-// ICH_PPI_DVIR<n>_EL2 (n = PPI# / 32)
-//   每位对应一个 PPI，DVI=1 表示该 PPI 直接注入到 vPPI
+// 进入 Guest (hyp/vgic-v5-sr.c:61-67)
+write_sysreg_s(bitmap_read(dvir, 0, 64), SYS_ICH_PPI_DVIR0_EL2); // 开 DVI
+bitmap_andnot(pendr, pendr, dvir, 64);   // pending 只恢复非 DVI 位——
+write_sysreg_s(pendr, SYS_ICH_PPI_PENDR0_EL2); // DVI 位由硬件实时驱动
 
-// 例如：启用 PPI #27 (Virtual Timer) 的 DVI
-val = read_sysreg(ICH_PPI_DVIR0_EL2);
-val |= BIT(27);
-write_sysreg(val, ICH_PPI_DVIR0_EL2);
-isb();
+// 退出 Guest (hyp/vgic-v5-sr.c:52)
+write_sysreg_s(0, SYS_ICH_PPI_DVIR0_EL2);       // 立即关 DVI
+```
+
+非 DVI 的 vPPI（SW_PPI、模拟源）走软件注入：置 `pending_latch` → queue 函数只 kick 不写寄存器（Guest 运行期寄存器归 Guest）→ 下次进入前 flush 汇总影子、restore 时写入 `ICH_PPI_PENDR`。
+
+Timer PPI 是 level 触发，pending 由源端电平驱动——Guest 重新编程 Timer 后电平撤销，物理/虚拟 pending 自然清除，无需 GIC 侧 ack/deactivate。泳道图：
+
+```
+            Guest                 Timer               GIC (PPI #27)        Hypervisor
+            ─────                 ─────               ─────────────        ──────────
+               │                      │                      │       phys PPI #27
+               │                      │                      │       disabled (setup)
+               │                      │  CNTV == CVAL        │            │
+               │                      │  wire asserted       │            │
+               │                      │──────────────────────►│            │
+               │                      │                      │  phys pending = 1
+               │                      │                      │        │
+               │                      │                      │  virt pending = 1
+               │                      │                      │        ▼
+               │  vIRQ delivered      │                      │
+               │◄─────────────────────│                      │
+  handler runs │                      │                      │
+               │  GICR CDIA (ack)     │                      │
+               │──────────────────────┼──────────────────────►│  Active = 1
+               │                      │                      │  pending unchanged
+               │  read CNTV_CTL_EL0   │                      │
+               │─────────────────────►│                      │
+               │  write CNTV_CVAL_EL0 │                      │
+               │─────────────────────►│  wire deasserted     │
+               │                      │──────────────────────►│
+               │                      │                      │  phys pending = 0
+               │                      │                      │  (level-driven)
+               │                      │                      │        │
+               │                      │                      │  virt pending = 0
+               │  GIC CDDI (deact)    │                      │
+               │──────────────────────┼──────────────────────►│  Active = 0
+               │  ERET                │                      │
+               │                      │                      │
 ```
 
 ---

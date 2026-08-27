@@ -72,29 +72,21 @@ its_vpe_db_proxy_move(vpe, from, to)             // irq-gic-v3-its.c:3863
 
 GICv4.1 虽然去掉了 proxy 设备（`has_rvpeid` 直接 return），但 doorbell LPI 的语义仍然绑定在 RD 上——这正是下面 1.4 节 bug 的根源。
 
-### 1.4 为什么共享 VPE 表的缓解措施失败了
+### 1.4 GICv4.1免VMOVP问题
 
 VMOVP 之所以必须存在且昂贵，根因是 **GICv4.x 的 VPE pending state（VPT）挂在 Redistributor 上**——迁移 VPE = 在 ITS 和两个 RD 之间同步/转移 pending state 的视图。GICv4.1 的缓解设计是：**多个 RD 共享同一 VPE 表**（`vpe_table_mask`），同一亲和组内的迁移无需真正移动状态。但这一设计在实践中被证明无法免除 VMOVP。下面逐步拆解失败机制。
 
-#### 1.4.1 共享 VPE 表共享了什么，没共享什么
+#### 1.4.1 同亲和组共享配置表
 
 共享 VPE 表的机制：亲和组由 `compute_common_aff()`（GICR_TYPER.Affinity 按 CommonLPIAff 掩码，irq-gic-v3-its.c:2545）定义。**组范围由硬件实现决定**，通过每个 RD 的 `GICR_TYPER.CommonLPIAff`（bits [25:24]）通告：0b00 = 全系统一组；0b01 = Aff3 相同（die 级）；0b10 = Aff3.Aff2 相同（die 内分区）；0b11 = Aff3.Aff2.Aff1 相同（cluster 级）。架构规则：同组 RD 必须共享同一份 vPE 表（及 LPI Configuration 表），不同组绝不能共享（否则 UNPREDICTABLE）；ITS 侧由 `GITS_TYPER.SVPET` 通告同样的层级数（`compute_its_aff()` 据此判断 ITS-RD 同组关系，:2555）。RD 初始化时先尝试继承同组 RD 的 `VPROPBASER` 配置（`inherit_vpe_l1_table_from_rd()`，:2926），继承成功后把自己的 `vpe_table_mask` 标记为与源 RD 同组（:3015）；同组第一个 RD 自行分配 VPE 表（:2997）。组粒度只影响迁移成本大小（组越大，同组迁移越多、越便宜），不改变"rdbase 更新不可省略"的结论。
 
-**共享的内容**：VPE 表内存本身（VPROPBASER 指向的表）。同组 RD 的 VPE 表条目地址一致，条目内的 pending 前缀与 VPT 指针对新旧 RD 同样可见——同组迁移无需在新 RD 处重建表条目，也没有"状态从旧 RD 搬到新 RD"的转移成本。注意区分两张表：**VPT 页（`vpe->vpt_page`）是每 VPE 全局唯一分配的**（`its_vpe_init()`，:4570-4575，VMAPP/VMOVP 编码其物理地址 :904），其地址与亲和组无关；**随组变化的是 VPE 表（条目）的地址**——不同亲和组各自分配一张 VPE 表，地址不同。
-
-**没有共享的内容**：VPE 表条目中的 **rdbase 关联**。VPE 表条目记录"这个 VPE 当前属于哪个 RD"，这个关联字段只有 VMOVP 命令能更新——**即使表内存是共享的，关联字段是全局唯一的，不能共享**。而恰恰是这个关联字段，锚定了 doorbell 的生成与投递位置。（？？？未核实）
-
 #### 1.4.2 为什么GICv4.1免VMOVP有问题
 
-根源在于doorbell的亲和性没有改变。GICv4.1的VMOVP会做doorbell的迁移，协议中写的是：“When VMOVP is issued, if DB=1, the vPE is marked as requesting Default Doorbell generation on the new target.” 硬件具体怎么实施的不得而知。如果在同一个亲和组免VMOVP，会存在一个问题。vLPI路由到新PE上，发现vPE不在位，让GICR触发doorbell LPI去唤醒vPE。结果由于doorbell亲和性没迁移，doorbell LPI在旧PE上触发了，host handle了，kick了vPE，vPE被唤醒了。这样也没问题，vPE被唤醒的目的达到了。
+根源在于doorbell的亲和性没有改变。doorbell的亲和性由vPE configuration table存储。GICv4.1的VMOVP会做doorbell的迁移，协议中写的是：“When VMOVP is issued, if DB=1, the vPE is marked as requesting Default Doorbell generation on the new target.” 硬件会去修改vPE configuration table中存的亲和性。如果在同一个亲和组免VMOVP，会存在一个问题。vLPI路由到新PE上，发现vPE不在位，让GICR触发doorbell LPI去唤醒vPE。因为硬件只改了vPE table，没改vPE configuration table。结果由于doorbell亲和性没迁移，doorbell LPI在旧PE上触发了，host handle了，kick了vPE，vPE被唤醒了。这样也没问题，vPE被唤醒的目的达到了。
 
 但是存在一个场景，host上一个PE被offline了。这个PE上所有的vPE都会被迁移到其他PE。这个时候vLPI来了，vPE不在位的话，会把doorbell lpi路由到offline的旧PE上，这样就丢中断了。
 
 因此，marc的解决办法是重新开启了同亲和性组的VMOVP。
-
-这里有几个问题没搞懂
-- doorbell中断的亲和性是怎么迁移的？
-- doorbell中断触发路由路径是怎样的？
 
 ## 二、GICv5 的迁移模型：Residency 取代 VMOVP
 
@@ -116,6 +108,9 @@ GICv4.x ITS (额外拥有):
 
 GICv5 的 ITS 退化为**纯翻译组件**（deviceID+eventID → LPI INTID），不持有任何 VPE 状态。VPE 相关的一切——pending 状态、residency、doorbell——全部移到 IRS 和 PE 的 IRI 上。
 
+并且GICv5中，doorbell中断和vPE所在PE是完全解耦的。doorbell就是一个普通的LPI，用于kick vPE。它只用关系自己要
+kick哪个vPE，不用关心必须路由到vPE所在的PE上。
+
 ### 2.2 中断状态在共享内存 IST 中
 
 GICv4.1 的根因是 pending state per-RD。GICv5 的 **IST（Interrupt State Table）是系统内存中的共享表**，由 IRS 硬件管理（驱动在 `gicv5_irs_init_ist()` 中分配，irq-gic-v5-irs.c:292，物理地址写入 `IRS_IST_BASER`）。任何 IRS 读取任何 VPE 的中断状态都是直接读内存——**不存在"状态属于某个 RD，迁移时要转移"的问题**。
@@ -136,6 +131,10 @@ GICv5 中 vCPU 迁移的完整操作序列（来自 GICv5 规范语义 + KVM IRS
   ISB
   （可选）读回 F 位检查操作是否成功/失败
 ```
+
+vPE 上位流程：
+
+![alt text](images/image-12.png)
 
 关键对比：
 
