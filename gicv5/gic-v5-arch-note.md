@@ -327,6 +327,8 @@ static void gicv5_its_compose_msi_msg(struct irq_data *d,
 - 每个 IWB 只连接到一个 ITS
 
 IWB 的 DeviceID 有 DTS/ACPI 表设定提供，在 IWB 驱动 probe 时，便会创建好 DTE。
+IWB 作为平台设备存在于内核中，它和ITS之间的的通信通道是实现定义的，协议并不指定IWB
+发送MSI给ITS。规范只锁死逻辑语义：ITS 收到的就是一个 {DeviceID, EventID, Event, Domain} 事件。
 
 **内核 IWB 配置代码**：
 
