@@ -45,7 +45,7 @@ PE 不实现某 Security state 则对应域不存在。所有 PE 必须实现相
 
 | | PPI | SPI | LPI |
 |---|-----|-----|-----|
-| **含义** | Private Peripheral Interrupt | Shared Peripheral Interrupt | Locality-specific Peripheral Interrupt |
+| **含义** | Private Peripheral Interrupt | Shared Peripheral Interrupt | Logical Peripheral Interrupt |
 | **可见范围** | 仅本 PE | 全局，可路由到任意 PE | 全局，可路由到任意 PE |
 | **数量** | 每 PE 0-127（0-63 架构定义，64-127 实现定义） | 全局固定，由 IRS 硬件决定（IRS_IDR5..7 上报） | 由 `IRS_IST_CFGR.LPI_ID_BITS` 决定（2^N 个），软件可在硬件上限内编程 |
 | **状态存储** | CPU-IF 系统寄存器 (`ICC_PPI_*_EL1`) | IRS 内部寄存器 | 软件分配的系统内存 (IST) |
