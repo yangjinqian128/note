@@ -76,3 +76,44 @@ echo 1 > /sys/kernel/debug/tracing/events/kvm/kvm_pvspin_kick_vcpu/enable
 | kick ≫ wait、`pv_hash_hops` 大 | hash 碰撞，需调 hash 表大小 |
 
 **一句话方法**：hackbench/will-it-scale 进沙箱 + 宿主过订阅 + `nopvspin` 交替对照 + 看宿主 CPU 与 p99。
+
+---
+
+## 7. hackbench 测 PV 的原理（`hackbench -P -g 4 -l 100000`）
+
+**负载本身**：4 组 = 4 sender + 4 receiver 共 8 进程，每 sender 经 pipe 向 receiver 发 10 万条 100B 消息，输出总耗时。
+
+```mermaid
+flowchart TB
+  A["sender 进程"] -->|"write(pipe)"| B["pipe buffer"]
+  B -->|"wake_up 唤醒"| C["receiver 进程"]
+  C -->|"read(pipe)"| B
+  A & C -->|"8 进程在 4-8 vCPU 上反复 写→唤醒→切走→读→唤醒→切走"| D["10 万次 × 4 组"]
+  D --> E["输出: Time = X.XXX s"]
+```
+
+**内核调用栈（每条消息一次）**：
+
+```
+sender: write(pipe) → pipe_write
+└─ wake_up_interruptible(&pipe->wait)
+   └─ try_to_wake_up(receiver)
+      └─ raw_spin_lock_irqsave(&rq->lock)   ← 跨 vCPU 抢 receiver 的 rq 锁（qspinlock）
+         └─ 入队 → schedule（本 CPU rq->lock）→ 切走
+```
+
+几秒内产生几十万次 spinlock 获取，大量跨 vCPU 竞争 `rq->lock` / `tasklist_lock` / `siglock`。
+
+**过订阅是关键开关**（临界区纳秒级，不过订阅测不出差异）：
+
+```mermaid
+flowchart TB
+  A["sender 拿 receiver 所在 vCPU 的 rq->lock"] --> B{"持有者 vCPU 在宿主上运行?"}
+  B -->|"是"| C["自旋几圈拿到，正常"]
+  B -->|"否（宿主切出）"| D["持有者拿锁睡在宿主队列"]
+  D --> E{"PV 开?"}
+  E -->|"关（nopvspin）"| F["等待者 WFE 空转整个时间片<br/>烧宿主 CPU 且与持有者抢核<br/>→ 锁拖到毫秒级 → Time 变大"]
+  E -->|"开"| G["SPIN_THRESHOLD 圈后 pv_hash + WFI 睡眠<br/>持有者释放 → pv_kick → KICK_CPU 直唤<br/>→ 锁交接最短 → Time 变小"]
+```
+
+**指标映射**：Time 下降 = 锁交接拖累减轻；宿主 CPU% 下降 = 等待者不再空转；`pv_wait_head` / `kvm_pvspin_kick_vcpu` 计数上涨 = 机制确认。不过订阅时 hackbench 只是 pipe 延迟基准，测不出 PV。

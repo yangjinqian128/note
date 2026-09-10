@@ -261,7 +261,7 @@ kvm_arch_disable_virtualization_cpu()          arm.c:2329
 
 引导核(执行 suspend 的核)是唯一"不断电流程中仍带电"的核,它靠 **syscore 钩子为主、cpu_pm 通知链为辅**两个机制处理。
 
-### 5.1 syscore 钩子:真正干活的路径
+### 5.1 syscore 钩子
 
 `kvm_syscore_ops`(`kvm_main.c:5676-5680`)注册于首个虚机启动时:
 
@@ -293,7 +293,7 @@ kvm_resume()                                 kvm_main.c:5668
 
 注意两个 flag 的接力:`kvm_hyp_initialized` 挂起时被 `cpu_hyp_uninit` 清零(`arm.c:2305`),恢复时 `cpu_hyp_init` 据此判断需要整体重装 hyp;`virtualization_enabled` 同理驱动 `kvm_resume` 侧的 `kvm_enable_virtualization_cpu`(`kvm_main.c:5596`)。
 
-### 5.2 nVHE vs VHE:同一时间轴的两种命运
+### 5.2 nVHE vs VHE
 
 两种模式走同一条挂起/恢复时间轴,唯一的分叉点在 `cpu_do_suspend`(`proc.S:89-124`):它用 **EL1 名字**保存系统寄存器(`mrs x8, vbar_el1` 等),在 E2H 重定向下这些名字命中 EL2 寄存器——所以 **VHE 的 EL2 状态被通用挂起机制顺带保存,nVHE 的 EL2 无人可救**(EL1 代码架构上读不到 EL2 寄存器)。后续所有动作都由这一个分叉决定:
 
@@ -396,26 +396,67 @@ vcpu_load → vgic_v4_load                        vgic-v4.c:368
 
 **结论**:两代 VLPI pending 都在内存 VPT,挂起/恢复理论上都闭环,且上游无"GICv4 不支持休眠"的任何声明;但 VPENDBASER/VPROPBASER 的历史 bug 全部集中在"状态丢失/残留"类,休眠唤醒让每颗核经历一次"寄存器归零再重建",建议实测覆盖:v4.0 doorbell(vpe_proxy 映射在 ITS device 表,BASER 恢复后仍在;doorbell pending 仅是唤醒提示)与 v4.1 vSGI 配置在恢复后的重建衔接。
 
-### 5.5 VFIO + SMMU:直通设备在 deep 挂起下不可用
+### 5.5 VFIO:为什么当前内核不支持直通设备的休眠唤醒
 
-问题不在 KVM,在 SMMUv3 驱动:**本树 SMMUv3 没有任何系统挂起支持**——`arm_smmu_driver`(arm-smmu-v3.c:5651-5659)只有 `probe/remove/shutdown`,没有 `.pm` 字段,也没有 syscore/cpu_pm 注册。
+#### 5.5.1 论证框架:三类状态与三类缺失
+
+直通设备跨 deep 休眠,需要恢复三类状态,每一类的"恢复执行者"要么缺失、要么不存在:
+
+| 要恢复的状态 | 恢复执行者 | 现状 |
+|---|---|---|
+| ① DMA 翻译(SMMU) | SMMUv3 驱动 | ❌ 无挂起支持(工程问题,补丁未合入,详见《smmu-suspend-resume-analysis》) |
+| ② 中断注入(MSI) | ITS + genirq 核心 | ⚠️ 部分:ITS 有 `its_restore_enable` ✅;MSI 消息恢复缺 genirq 的 `IRQD_RESUMING` 机制(未合入,见 SMMU 笔记 §四) |
+| ③ 设备自身状态 | "懂设备语义的驱动" | ❌ 执行者消失(核心论证,5.5.2/5.5.3) |
+
+#### 5.5.2 设备状态分层:标准层 vs 内部层
+
+- **配置空间(标准层)**:PCI PM 规范有标准协议,PCI core 有通用实现(`pci_save_state`/`pci_restore_state`,pci.c:1769;驱动无 pm 回调时 `pci_pm_suspend_noirq` 自动兜底,pci-driver.c)——**这一层直通设备也有**,挂起/唤醒后配置空间能回来;
+- **内部状态**(MMIO 寄存器、固件上下文、DMA 引擎、内部队列):**没有标准协议**。普通设备的"保存协议"= 驱动自己的 `.suspend/.resume`(nvme 存队列配置、ixgbe 存过滤表)——每家的驱动就是各自私有保存协议的**唯一执行者**。
+
+#### 5.5.3 直通如何让执行者消失(核心论证)
 
 ```
-挂起: dpm_suspend → 设备驱动(如 NVMe)suspend    设备被停掉
-      SMMU 随电源域掉电:Stream Table Base 寄存器、STE/CD 缓存、
-      命令队列、SMMU_CR0 配置 —— 全部丢失,无人保存
-
-恢复: dpm_resume → 设备驱动 resume 重新初始化设备、重新申请 MSI
-      ├─ MSI 路径:host ITS 由 its_restore_enable 恢复 → 中断链路 ✅ 能活
-      └─ DMA 路径:设备恢复 DMA 后,事务经过 SMMU
-                   → 无有效 Stream Table/STE → SMMU abort(DMA fault)
-                   → 直通设备在 guest 里彻底不可用 ❌
+普通设备:  dpm_suspend → nvme_suspend()   驱动懂语义 → 保存/重建内部状态      ✅ 恢复链完整
+直通设备:  驱动已解绑(driver_override → unbind → bind vfio-pci)
+           dpm_suspend → vfio-pci 无系统睡眠回调 → PCI core 通用路径(仅配置空间)
+           guest 驱动懂语义,但被 freezer 冻结,对 host 睡眠无感知(非协作)
+           vfio-pci 是"通道提供者,不是设备管理者"——不懂设备语义
+           → 内部状态无人保存/恢复                                           ❌
 ```
 
-- **VFIO 侧**(vfio_iommu_type1.c)同样没有任何 resume 逻辑——domain/映射都在内存里,但没有驱动侧恢复目标可言;
-- **s2idle 不受影响**:电源不断,SMMU 状态保持,直通跨 s2idle 可用;**deep 是分水岭**;
-- 故障形态:挂起/唤醒本身成功,唤醒后 guest 里 passthrough 设备 DMA 失败(SMMU event queue 报 `C_BAD_STE`/abort 类错误),host 需要重启或 SMMU 重新初始化;
-- 解决路径:为 SMMUv3 驱动补系统挂起支持(syscore/cpu_pm 保存恢复 SMMU 寄存器、重建队列与 STE/CD,或整表保存)——这是设备驱动侧工程,与本树 KVM 无关,但直接决定"VFIO 虚机能否跨 deep 休眠"。
+VFIO 的资源两维切分(哪些归 vfio-pci 代管、哪些始终在 guest 驱动手里):
+
+| 资源 | 物理侧(vfio-pci) | 语义/内容侧 |
+|---|---|---|
+| PCI 配置空间 | ✅ 代管(初始快照 `vdev->pm_save`,拦截 guest 写) | guest 驱动 |
+| BAR 区域(MMIO 寄存器) | ✅ `pci_request_regions` + 映射 | guest 驱动 |
+| MSI/MSI-X 物理中断 | ✅ irq vectors → eventfd/irqfd → 注入 | guest 驱动 |
+| IOMMU 页表 | vfio_iommu_type1 + SMMU 驱动 | QEMU(VFIO_IOMMU_MAP_DMA) |
+| DMA 引擎行为 / 设备内部状态 | ❌ 不管,也不懂 | guest 驱动 ← 悬空 |
+| 电源状态 | runtime PM(guest 驱动置 D3 时同步) | guest 驱动 |
+| 设备重置 | FLR/bus reset | — |
+
+即使未来给 vfio-pci 加了系统睡眠回调,回调里也没有设备语义可执行——设备层恢复只能走"挂起前 guest quiesce 设备 → 唤醒后 guest 重新初始化"的协议路径。
+
+#### 5.5.4 vfio-pci 的 PM 现状(代码事实佐证)
+
+- `dev_pm_ops` 只设 runtime PM(`SET_RUNTIME_PM_OPS`,vfio_pci_core.c:585-590),**系统睡眠回调(.suspend/.resume)全空**;系统挂起时走 PCI core 通用路径(配置空间 → D3hot),见 5.5.2;
+- 为什么 runtime 能做、system sleep 不能:
+
+| | runtime suspend(✅ 有) | system suspend(❌ 无) |
+|---|---|---|
+| 触发者 | guest 驱动(设备 idle → 置 D3) | host(`echo mem`) |
+| 协作性 | ✅ guest 已 quiesce 设备 | ❌ guest 无感知、被冻结 |
+| vfio-pci 可执行内容 | mask INTx、同步降 D3、保存 `pm_save` | 无语义知识可执行 |
+
+- 结论:VFIO 场景下"设备级 PM"本质是 **guest 的责任**——guest 配合的 PM 才可能安全(所以 runtime 有),host 单方面的 PM 没有执行者(所以 system sleep 无)。
+
+#### 5.5.5 结论
+
+- 三类状态两缺(①③)一残(②)→ **当前内核不支持 VFIO 直通跨 deep 休眠**;
+- 未来路径:工程补丁(SMMU、`IRQD_RESUMING`)+ guest 协作协议(挂起前 quiesce、唤醒后重初始化);
+- 行业佐证:[Proxmox 阻止带直通 VM 挂起](https://lists.proxmox.com/pipermail/pve-devel/2022-August/053807.html)、libvirt `virsh save` 拒绝、`systemd-inhibit` 是标准方案、[Arrow Lake-P iGPU s2idle 回归](https://gitlab.com/qemu-project/qemu/-/work_items/3086);
+- 附注:**s2idle 不受影响**(电源不断);纯软件 vSMMU(QEMU 模拟 + virtio)不经过物理 SMMU,挂起无影响;硬件辅助 vSMMU(嵌套,本树支持)与普通 VFIO 同根因。
 
 
 
@@ -431,11 +472,11 @@ vcpu_load → vgic_v4_load                        vgic-v4.c:368
 | host ITS | `its_save_disable`(`irq-gic-v3-its.c:4998`) | `its_restore_enable`(`:5034`),先于 `kvm_resume` 执行 | ✓ 闭环 |
 | GICv4 vPE/VLPI | vcpu_put 时 vPE 已 non-resident(`vgic-v4.c:358`);pending 位在内存 VPT(per-vPE,两代都有) | vcpu_load → `vgic_v4_load`(`vgic-v4.c:368`)→ `its_vpe_schedule` 重写 VPENDBASER + VMAPP 重挂接 | ✅ 详见 §五·4:两代都理论闭环;仅建议实测 doorbell/vSGI 衔接 |
 | virtio(模拟/kernel 态) | 队列全在 guest RAM | 无 | ✓ 低风险,验证 IO 连续性即可 |
-| VFIO 直通 + SMMU | 设备驱动 pm 回调 + ITS restore | 设备驱动 pm 回调 | ❌ 详见 §五·5:SMMUv3 驱动无挂起支持,deep 下 DMA 路径不可用;MSI 路径经 ITS restore 可恢复 |
+| VFIO 直通 + SMMU | 设备驱动 pm 回调 + ITS restore | 设备驱动 pm 回调 | ❌ 详见 §五·5 论证框架:三类状态两缺一残(设备状态执行者消失 / SMMU 无支持 / MSI 消息缺 IRQD_RESUMING) |
 | pkvm | — | — | ✓ 机制支持:EL2 经 PSCI relay 由 hyp 自重建(§五·3,有上游修复记录);受保护 VM 跨休眠语义建议实测 |
 
 
-**结论**:deep + VFIO 直通在 arm64 上目前**不可用**(SMMU 驱动缺失挂起支持);GICv4.0 直投有 pending 丢失风险待实测;两者都不影响纯虚拟化(无直通/无 GICv4.0 直投)场景的结论。
+**结论**:deep + VFIO 直通在 arm64 上目前**不可用**,根因在设备侧(§五·5 的三类状态两缺一残):SMMU 无挂起支持(工程问题,见独立笔记)、MSI 消息缺 `IRQD_RESUMING`(工程问题)、设备状态执行者消失(架构性,只能 guest 配合或阻止 host 挂起)。纯虚拟化(无直通)场景不受影响。
 
 ## 参考链接
 
@@ -448,6 +489,8 @@ vcpu_load → vgic_v4_load                        vgic-v4.c:368
 - [irqchip/gic-v4: Fix occasional VLPI drop(6479450f,IDbits/VPENDBASER 残留状态)](https://git.raptorcs.com/git/blackbird-obmc-linux/commit/?id=6479450f72c1391c03f08affe0d0110f41ae7ca0)
 - [KVM: arm64: vgic-v4: Make the doorbell request robust w.r.t preemption(b321c31c9b7b)](https://git.armlinux.org.uk/cgit/linux.git/commit/include/kvm?id=b321c31c9b7b309dcde5e8854b741c8e6a9a05f0)
 - [GICv4 直接注入与 VPENDBASER/VPT 上下文切换协议(GICv3 软件 overview)](https://code84.com/831910.html)
+- [Proxmox 阻止带 PCI passthrough 的 VM suspend to disk](https://lists.proxmox.com/pipermail/pve-devel/2022-August/053807.html)
+- [QEMU #3086: Arrow Lake-P iGPU passthrough 在 host s2idle resume 后显示失败](https://gitlab.com/qemu-project/qemu/-/work_items/3086)
 
 ---
 
