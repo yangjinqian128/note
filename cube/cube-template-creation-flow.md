@@ -65,24 +65,24 @@ flowchart TB
 ### 途径 A 构建流水线
 
 ```mermaid
-flowchart LR
-    subgraph Entry["入口"]
+flowchart TD
+    subgraph Entry["① 入口 · API 转发"]
+        direction TB
         A["POST /api/v1/sdk/templates<br/>CubeOps sdk.go:703"] --> B["POST /cube/template/from-image<br/>CubeMaster template_from_image.go:27"]
     end
-    subgraph Build["CubeMaster 主机构建(不是 buildkit)"]
-        B --> C["拉镜像三选一<br/>docker pull / skopeo+umoci / native 流式"]
-        C --> D["展开 rootfs"]
-        D --> E["注入 envd + CubeEgress CA<br/>artifact_build.go:303"]
-        E --> F["truncate + mkfs.ext4 -d 打包<br/>ext4.go:20"]
-        F --> G["内容寻址:rfs- + sha256(fingerprint)<br/>相同输入跨模板复用同一份"]
+
+    subgraph Build["② CubeMaster 主机构建(不是 buildkit)"]
+        direction TB
+        C["拉镜像三选一<br/>docker pull / skopeo+umoci / native 流式"] --> D["展开 rootfs"] --> E["注入 envd + CubeEgress CA<br/>artifact_build.go:303"] --> F["truncate + mkfs.ext4 -d 打包<br/>ext4.go:20"] --> G["内容寻址:rfs- + sha256(fingerprint)<br/>相同输入跨模板复用同一份"]
     end
-    subgraph Dist["分发到节点"]
-        G --> H["CreateImage RPC"]
-        H --> I["节点下载 + sha256 校验"]
-        I --> J["起临时沙箱 templateID_0"]
-        J --> K["HTTP probe 2xx → cube-runtime snapshot<br/>内存 dump 进 CoW 卷"]
-        K --> L["节点 catalog 落库 → 模板 READY"]
+
+    subgraph Dist["③ 分发到节点 → 拍快照"]
+        direction TB
+        H["CreateImage RPC"] --> I["节点下载 + sha256 校验"] --> J["起临时沙箱 templateID_0"] --> K["HTTP probe 2xx → cube-runtime snapshot<br/>内存 dump 进 CoW 卷"] --> L["节点 catalog 落库 → 模板 READY"]
     end
+
+    B --> C
+    G --> H
 ```
 
 **要点**:构建发生在 CubeMaster 主机上;节点只负责下载 ext4、起临时 VM、拍快照。模板"内容"由 probe 决定——是"MicroVM 起来后等 probe 2xx 才冻的 fs+memory",不是进程刚启动的镜像。
