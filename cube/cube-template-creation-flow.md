@@ -87,6 +87,27 @@ flowchart TD
 
 **要点**:构建发生在 CubeMaster 主机上;节点只负责下载 ext4、起临时 VM、拍快照。模板"内容"由 probe 决定——是"MicroVM 起来后等 probe 2xx 才冻的 fs+memory",不是进程刚启动的镜像。
 
+### 途径 A · 节点侧执行:AppSnapshot 步骤
+
+> ③ 里「起临时沙箱 → probe → 快照 → catalog 落库」在节点上的具体实现是 Cubelet 的 `service.AppSnapshot`(Cubelet/services/cubebox/appsnapshot.go:57),完整步骤:
+
+```mermaid
+flowchart TD
+    P0["0. 前置校验<br/>注解/backend=CoW/templateID 安全"] --> P1["Step1 起临时沙箱 templateID_0<br/>Create 内 probe 通过才返回<br/>PreConditionFailed → 销毁重试"]
+    P1 --> P2["Step2 取 cubebox spec<br/>resource/disk/pmem/kernel"]
+    P2 --> P3["Step3 建 CoW 内存卷<br/>tpl-<id>-memory"]
+    P3 --> P4["收集 envd 版本(exec 冻结前)"]
+    P4 --> P5["Step4 cube-runtime 全量快照<br/>RAM dump 进内存卷"]
+    P5 --> P6["提交 rootfs 卷<br/>build-rootfs → tpl-<id>-rootfs"]
+    P6 --> P7["Step5 销毁临时沙箱<br/>去激活 CoW 对象"]
+    P7 --> P8["Step6 tmp rename 落位<br/>+ shim spec 链接"]
+    P8 --> P9["Step7 写状态标志<br/>/data/cube-shim/snapshot(+i)"]
+    P9 --> P10["catalog 落库 → 返回 success"]
+    P10 --> P11["CubeMaster: replica READY"]
+```
+
+> 失败保护:defer 里 `!snapshotSuccess && !temporaryCubeboxDestroyed` 时 force destroy 临时沙箱(appsnapshot.go:187-212),任何一步失败都先清理再报错。
+
 ### 产物 GC(7 天 TTL 是"从最后引用起算")
 
 ```mermaid
