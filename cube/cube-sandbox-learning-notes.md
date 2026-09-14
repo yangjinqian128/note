@@ -66,11 +66,12 @@ flowchart TB
 ④ 拉起 CubeShim（⑤）
 ```
 
-### ④ Cubelet → CubeCoW：克隆卷（FICLONE）
+### ④ Cubelet → CubeCoW：克隆 rootfs 卷（FICLONE）
 
-- 消息内容："把模板的 rootfs 卷和内存快照卷各克隆一份"
+- 消息内容："把模板的 rootfs 卷克隆一份"
 - CubeCoW 用 XFS reflink 的 FICLONE：只复制**元数据**（块映射表 + 引用计数），物理数据零拷贝——O(1)，和卷大小无关
-- 结果：沙箱拿到自己的可写 rootfs + 内存镜像文件；之后写多少才真正占多少磁盘
+- 结果：沙箱拿到自己的可写 rootfs（私有 CoW，写多少才真正占多少磁盘）
+- 内存快照卷不在这里克隆：内存镜像在模板构建期由 cube-runtime 现拍（全量 pwrite 进新建空卷）；开沙箱时 VMM 直接 mmap 只读共享（MAP_PRIVATE，页级 CoW）。FICLONE 只用两处：rootfs 克隆、commit/pause 的增量内存
 
 ### ⑤ Cubelet → CubeShim：拉起（Shim v2，ttrpc）
 

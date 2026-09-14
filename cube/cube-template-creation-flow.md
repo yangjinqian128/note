@@ -1,8 +1,8 @@
 # CubeSandbox 模板创建 & 沙箱启动全链路
 
-> 调研时间:2026-09-09(代码级调研,关键结论附 file:line 出处)。
+> 调研时间:2026-09-09(代码级调研,关键结论附 file:line 出处);2026-09-13 对照 HEAD f7b2317c 勘误修订:修正文件路径与语义误差,全文精简为「模板创建 + 沙箱通过模板启动」两条主线。
 
-**一句话结论**:模板 = 「OCI 镜像展开后的 ext4 rootfs」+「各节点 probe 2xx 后拍的 MicroVM 内存+文件系统快照」。开沙箱 = 从这份快照恢复一台轻量 VM,而不是像容器那样跑镜像。
+**一句话结论**:模板 = 「OCI 镜像展开后的 ext4 rootfs」+「各节点 probe 200–399 后拍的 MicroVM 内存快照 + reflink rootfs 卷」。开沙箱 = 恢复内存与设备状态(文件系统是 CoW 克隆,不是快照恢复),而不是像容器那样跑镜像。
 
 ---
 
@@ -12,193 +12,123 @@
 flowchart TB
     subgraph S1["① 模板构建 · CubeMaster 主机"]
         direction TB
-        T1["OCI 镜像"] -->|"pull:docker / skopeo+umoci / native"| T2["展开 rootfs"]
+        T1["OCI 镜像"] -->|"pull:native 流式(默认)/ skopeo+umoci / docker"| T2["展开 rootfs"]
         T2 -->|"注入 envd + CubeEgress CA"| T3["mkfs.ext4 打包<br/>ext4 工件 rfs-*"]
-        T3 -->|"分发给各节点"| T4["临时 MicroVM<br/>跑到 HTTP probe 2xx"]
+        T3 -->|"分发给各节点"| T4["临时 MicroVM<br/>跑到 HTTP probe 2xx–3xx"]
         T4 -->|"内存 + CoW 快照"| T5["模板 READY<br/>tpl-*"]
     end
 
     subgraph S2["② 沙箱创建 · 控制面"]
         direction TB
         C1["SDK → CubeAPI :3000<br/>或 WebUI → CubeOps"] -->|"POST /cube/sandbox"| C2["CubeMaster 模板解析<br/>ID → 容器规格/卷/节点"]
-        C2 --> C3["timeout 归一化<br/>仓库默认 -1 = 永不超时"]
-        C3 --> C4["调度<br/>prefilter → filter → score"]
-        C4 -->|"gRPC RunCubeSandboxRequest<br/>proto 无 timeout 字段"| C5["Cubelet"]
+        C2 --> C3["调度选节点<br/>(prefilter → filter → score)"]
+        C3 -->|"gRPC RunCubeSandboxRequest"| C4["Cubelet"]
     end
 
     subgraph S3["③ 节点执行 · Cubelet"]
         direction TB
-        N1["4 步流水线<br/>createid→资源→cgroup→cubebox"] --> N2["containerd NewTask"]
+        N1["Cubelet 流水线<br/>(资源/cgroup 等准备)"] --> N2["containerd NewTask"]
         N2 -->|"shim v2"| N3["CubeShim<br/>内嵌 VMM"]
         N3 -->|"restore_vm / boot_vm"| N4["MicroVM"]
         N4 -->|"vsock"| N5["cube-init → cube-agent"]
     end
 
-    subgraph S4["④ 生命周期 · CLM"]
-        direction TB
-        L1["Redis lifecycle 流<br/>Timeout/EndAt/AutoPause"] --> L2["sweeper 空闲到期"]
-        L2 --> L3{"AutoPause?"}
-        L3 -->|"pause"| L4["CoW 快照挂起"]
-        L3 -->|"kill"| L5["销毁"]
-        L6["CubeProxy 撞 paused"] -->|"内部 resume"| L7["restore_vm 恢复"]
-    end
-
     T5 -.->|"模板就绪"| C2
-    C5 --> N1
-    C2 -.->|"创建成功 hook"| L1
-    C4 -.->|"查节点本地模板快照"| T5
+    C4 --> N1
+    C3 -.->|"查节点本地模板快照"| T5
 ```
 
-图例:实线 = 主调用流;虚线 = 状态读写 / 就绪依赖。①–④ 对应下文四节。
+图例:实线 = 主调用流;虚线 = 状态读写 / 就绪依赖。①–③ 对应下文三节。
 
 ---
 
-## 二、模板是怎么造出来的(4 条途径)
+## 二、模板是怎么造出来的(OCI 镜像构建)
 
-| 途径 | 入口 API | 产物语义 |
-|---|---|---|
-| **A. OCI 镜像构建**(主路径) | CubeOps `POST /api/v1/sdk/templates`(sdk.go:703)→ CubeMaster `POST /cube/template/from-image` | ext4 rootfs + 各节点内存快照 |
-| **B. commit 运行中沙箱** | `POST /cube/sandbox/commit`(template_commit.go:57) | 单节点 1 副本,其余 PARTIALLY_READY |
-| **C. 用户快照** | `POST /cube/snapshot` → `SubmitSandboxSnapshot` | `snap-*`,可回滚/克隆/再开沙箱 |
-| **D. legacy** | `POST /cube/template`(传 CreateCubeSandboxReq) | 新前端/SDK 已不走 |
+**一句话**:把 OCI 镜像交给 Cube,Cube 先把它展开成 ext4 根文件系统,再在每个节点上起一台临时 MicroVM、等沙箱里的服务通过健康检查后拍下「内存 + 文件系统快照」——这份"预热好的存档"就是模板。
 
-### 途径 A 构建流水线
+### 构建流水线
 
 ```mermaid
 flowchart TD
-    subgraph Entry["① 入口 · API 转发"]
+    subgraph Entry["① 入口 · 收请求"]
         direction TB
-        A["POST /api/v1/sdk/templates<br/>CubeOps sdk.go:703"] --> B["POST /cube/template/from-image<br/>CubeMaster template_from_image.go:27"]
+        A["用户提交 OCI 镜像<br/>(经 CubeOps 转发)"] --> B["CubeMaster 收到构建请求"]
     end
 
-    subgraph Build["② CubeMaster 主机构建(不是 buildkit)"]
+    subgraph Build["② CubeMaster 主机上 · 镜像 → ext4 文件"]
         direction TB
-        C["拉镜像三选一<br/>docker pull / skopeo+umoci / native 流式"] --> D["展开 rootfs"] --> E["注入 envd + CubeEgress CA<br/>artifact_build.go:303"] --> F["truncate + mkfs.ext4 -d 打包<br/>ext4.go:20"] --> G["内容寻址:rfs- + sha256(fingerprint)<br/>相同输入跨模板复用同一份"]
+        C["拉取镜像,展开成 rootfs 目录"] --> D["注入 envd + CubeEgress CA<br/>(沙箱启动器 + 出网信任证书)"] --> E["打包成 ext4 文件<br/>(内容寻址:相同镜像复用同一份)"]
     end
 
-    subgraph Dist["③ 分发到节点 → 拍快照"]
+    subgraph Dist["③ 各节点 · 试跑一次 → 拍快照"]
         direction TB
-        H["CreateImage RPC"] --> I["节点下载 + sha256 校验"] --> J["起临时沙箱 templateID_0"] --> K["HTTP probe 2xx → cube-runtime snapshot<br/>内存 dump 进 CoW 卷"] --> L["节点 catalog 落库 → 模板 READY"]
+        F["下载 ext4 并校验"] --> G["起临时 MicroVM<br/>等里面的服务通过健康检查"] --> H["拍「内存 + 文件系统」快照"] --> I["登记进节点 catalog<br/>→ 模板 READY"]
     end
 
     B --> C
-    G --> H
+    E -->|"CreateImage RPC"| F
 ```
 
-**要点**:构建发生在 CubeMaster 主机上;节点只负责下载 ext4、起临时 VM、拍快照。模板"内容"由 probe 决定——是"MicroVM 起来后等 probe 2xx 才冻的 fs+memory",不是进程刚启动的镜像。
+**要点**:构建发生在 CubeMaster 主机上;节点只负责下载 ext4、起临时 VM、拍快照。模板"内容"由 probe 决定——是"MicroVM 起来后等 probe 200–399 才冻的 fs+memory"(默认 GET :port/health、30s 预算、500ms 周期、连续失败 60 次放弃),不是进程刚启动的镜像。
 
-### 途径 A · 节点侧执行:AppSnapshot 步骤
+### 节点侧执行:AppSnapshot 步骤
 
 > ③ 里「起临时沙箱 → probe → 快照 → catalog 落库」在节点上的具体实现是 Cubelet 的 `service.AppSnapshot`(Cubelet/services/cubebox/appsnapshot.go:57),完整步骤:
 
 ```mermaid
 flowchart TD
-    P0["0. 前置校验<br/>注解/backend=CoW/templateID 安全"] --> P1["Step1 起临时沙箱 templateID_0<br/>Create 内 probe 通过才返回<br/>PreConditionFailed → 销毁重试"]
-    P1 --> P2["Step2 取 cubebox spec<br/>resource/disk/pmem/kernel"]
-    P2 --> P3["Step3 建 CoW 内存卷<br/>tpl-<id>-memory"]
-    P3 --> P4["收集 envd 版本(exec 冻结前)"]
-    P4 --> P5["Step4 cube-runtime 全量快照<br/>RAM dump 进内存卷"]
-    P5 --> P6["提交 rootfs 卷<br/>build-rootfs → tpl-<id>-rootfs"]
-    P6 --> P7["Step5 销毁临时沙箱<br/>去激活 CoW 对象"]
-    P7 --> P8["Step6 tmp rename 落位<br/>+ shim spec 链接"]
-    P8 --> P9["Step7 写状态标志<br/>/data/cube-shim/snapshot(+i)"]
-    P9 --> P10["catalog 落库 → 返回 success"]
-    P10 --> P11["CubeMaster: replica READY"]
+    subgraph S0["阶段一 · 准备:起临时沙箱(Step0–3)"]
+        direction TB
+        A["0. 前置校验<br/>注解 / backend=CoW / templateID"] --> B["Step1 起临时沙箱 templateID_0<br/>probe 通过才返回,PreConditionFailed 销毁重试"] --> C["Step2 取规格 resource/disk/pmem/kernel"] --> D["Step3 建 CoW 内存卷 tpl-<id>-memory<br/>(空卷,XfsCow 后端)"]
+    end
+
+    subgraph S1["阶段二 · 快照:冻结这台 VM(Step4)"]
+        direction TB
+        E["收集 envd 版本<br/>(冻结前,快照期间禁 exec)"] --> F["cube-runtime 全量内存快照<br/>vm.pause → RAM 写进内存卷(无压缩)→ vm.resume"] --> G["提交 rootfs 卷<br/>build-rootfs → tpl-<id>-rootfs(FICLONE)"]
+    end
+
+    subgraph S2["阶段三 · 收尾:拆临时沙箱 + 落位(Step5–7)"]
+        direction TB
+        H["Step5 销毁临时沙箱<br/>去激活 CoW 对象"] --> I["Step6 tmp rename 落位<br/>+ shim spec 链接"] --> J["Step7 写状态标志 /data/cube-shim/snapshot(+i)"]
+    end
+
+    K["节点 catalog 落库 → 返回 success"] --> L["CubeMaster: replica READY"]
+
+    D --> E
+    G --> H
+    J --> K
 ```
 
-> 失败保护:defer 里 `!snapshotSuccess && !temporaryCubeboxDestroyed` 时 force destroy 临时沙箱(appsnapshot.go:187-212),任何一步失败都先清理再报错。
-
-### 产物 GC(7 天 TTL 是"从最后引用起算")
-
-```mermaid
-flowchart TD
-    G1["artifact 建好<br/>gc_deadline = now + 7 天<br/>job_constants.go:66"] --> G2{"被引用?<br/>模板 / replica / job"}
-    G2 -->|"引用中 → 每次引用或删除都续期"| G2
-    G2 -->|"最后一个引用消失"| G3["三阶段 last-owner 清理<br/>Phase1 记账 → Phase2 节点 DestroyImage → Phase3 删 master 本地"]
-    G3 -->|"节点上有沙箱在用"| G4["CLEANUP_PENDING<br/>10 分钟一轮 GC 重试"]
-    G4 --> G3
-```
-
----
+> 失败保护:`forceDestroyCubebox` 闭包在 appsnapshot.go:187-206,真正的 defer 注册在 :208-212(`!snapshotSuccess && !temporaryCubeboxDestroyed` 时 force destroy),任何一步失败都先清理再报错。注意该 defer 在 Create **成功之后**才注册;Create 失败(含 probe 失败)由 Cubelet workflow 的 failover 清理。
 
 ## 三、控制面:用模板创建沙箱
 
-### 创建时序(两条入口汇聚同一端点)
+### 创建时序(三条入口汇聚同一端点)
 
 ```mermaid
 sequenceDiagram
     participant SDK as SDK / 客户端
     participant API as CubeAPI :3000 或 CubeOps
     participant CM as CubeMaster
-    participant SCH as 调度器
     participant CL as Cubelet
     participant R as Redis
 
-    SDK->>API: POST /sandboxes(templateID, timeout, env, network...)
-    API->>CM: POST /cube/sandbox(注解:template.id + version=v2)
-    CM->>CM: dealCubeboxCreateReqWithTemplateCenter<br/>模板 ID → 容器规格/卷/节点 scope
-    CM->>CM: resolveTimeoutSeconds(省略 + 集群默认 -1 → 永不超时)
-    CM->>SCH: Select(选节点)
-    SCH-->>CM: 选中节点
+    SDK->>API: 创建沙箱请求<br/>(templateID, timeout, env, network...)
+    API->>CM: POST /cube/sandbox<br/>(带 templateID)
+    CM->>CM: 模板解析(dealCubeboxCreateReqWithTemplateCenter)<br/>ID → 容器规格/卷/节点 scope
+    CM->>CM: 调度(内置模块,prefilter→filter→score)<br/>选中一个节点
     CM->>CL: gRPC Create(RunCubeSandboxRequest)
     CL-->>CM: sandboxID / sandboxIP / 端口映射
-    CM->>R: proxy map + lifecycle 事件(Timeout/EndAt/AutoPause)
+    CM->>R: 登记路由表 + 生命周期元数据
     CM-->>API: 创建成功
     API-->>SDK: Sandbox
 ```
 
-> 两条入口的差别:直接 SDK 经 **CubeAPI**(3000 端口,字段映射最全:env_vars→create_time_env_vars、lifecycle→auto_pause);WebUI/AgentHub 经 **CubeOps**,只转发 templateID/timeout/autoPause/metadata。Go SDK 目前没有 lifecycle 选项,只有 Python SDK 有。
-
-### 模板解析(唯一落点,进入调度前同步完成)
-
-```mermaid
-flowchart TD
-    P1["/cube/sandbox handler"] --> P2{"注解 version = v2?"}
-    P2 -->|"是"| P3["ResolveTemplateIdentifier<br/>别名/短 ID 归一"]
-    P2 -->|"否"| P9["legacy 本地模板配置"]
-    P3 --> P4["GetTemplateRequest<br/>取出模板的 CreateCubeSandboxReq<br/>容器规格/卷/网络/注解"]
-    P4 --> P5{"模板在健康节点就绪?"}
-    P5 -->|"否"| P6["创建失败 NotFound"]
-    P5 -->|"是"| P7{"kind?"}
-    P7 -->|"template"| P8["注入组件版本注解"]
-    P7 -->|"snapshot"| P10["钉节点 / DistributionScope<br/>跨节点需 S3 backend"]
-    P7 -->|"pause_snapshot"| P11["拒绝(仅内部 resume 用)"]
-    P8 --> P12["合并容器/卷/网络/注解<br/>→ 请求规格完备"]
-    P10 --> P12
-    P12 --> P13["调度:filter 里 template_locality<br/>校验节点本地模板快照"]
-```
-
-关键点:物理卷引用**不下发**给 Cubelet,只传逻辑 ID + backend,由 Cubelet 按 `RuntimeSnapshotID` 查本地 catalog(cubeboxutil.go:584-591)——防跨租户注解注入。
-
-### timeout 的归一化与落点
-
-```mermaid
-flowchart TD
-    X1{"客户端传了 timeout?"} -->|"没传"| X2{"集群 default_timeout_insec > 0?"}
-    X1 -->|"传了 < 0"| X3["NeverTimeout(-1) 永不回收"]
-    X1 -->|"传了 >= 0"| X4["用客户端值"]
-    X2 -->|"是"| X5["用集群默认"]
-    X2 -->|"否(仓库默认 -1)"| X3
-    X3 --> X6["写入 Redis lifecycle meta<br/>不发给 Cubelet,sandbox_spec 也故意剔除"]
-    X4 --> X6
-    X5 --> X6
-    X6 --> X7["CLM sweeper 到点执行<br/>AutoPause ? pause : kill"]
-```
+> 入口实为三条:直接 SDK 经 **CubeAPI**(3000 端口,字段映射最全:env_vars→create_time_env_vars、lifecycle→auto_pause);**WebUI** 经 CubeOps,只转发 templateID/timeout(>0)/autoPause/metadata;**AgentHub** 经 CubeOps 的另一条路(agenthub.go:246-293),另转发 network_config/distribution_scope,timeout 硬编码 86400。Go SDK 目前没有 lifecycle 选项,只有 Python SDK 有。
 
 ---
 
 ## 四、节点侧:沙箱真正跑起来
-
-### Cubelet 四步流水线
-
-```mermaid
-flowchart LR
-    W0["gRPC Create"] --> W1["step1<br/>createid + appsnapshot"]
-    W1 --> W2["step2 并行<br/>images / storage / volume /<br/>network / cgroup 前置 / sandbox-store"]
-    W2 --> W3["step3 cgroup<br/>算 VMM vCPU/内存<br/>→ OCI 注解 cube.vmmres"]
-    W3 --> W4["step4 cubebox<br/>containerd NewTask<br/>→ 拉起 CubeShim"]
-    W4 --> W5["envd 初始化<br/>POST sandboxIP:49983/init"]
-```
 
 ### VM 启动(有快照走 restore,没快照冷启动)
 
@@ -213,7 +143,7 @@ sequenceDiagram
 
     CT->>SH: Create + Start(ttrpc)
     SH->>SH: 解析 OCI 注解<br/>vmmres / net / disk / pmem
-    alt 有模板快照(<60ms 的秘密)
+    alt 有模板快照(RAM mmap 惰性填充,README 口径 ~60ms)
         SH->>VMM: restore_vm(内存镜像)
     else 冷启动
         SH->>VMM: boot_vm
@@ -226,61 +156,5 @@ sequenceDiagram
     AG-->>SH: 就绪,沙箱可用
 ```
 
-> 设备形态:virtio-net(host TAP,fd 经 unix socket SCM_RIGHTS 交接)、virtio-blk、virtiofs、**pmem0=guest OS 镜像、pmem1=cube-agent.ext4**、vsock。guest 的 `/sbin/init` 就是 cube-init。
+> 设备形态:virtio-net(host TAP,fd 先从 Cubelet tap 池取——unix socket SCM_RIGHTS,失败才 open /dev/net/tun)、virtio-blk(业务数据卷 → guest `/dev/vdX`)、virtiofs(tag cubeShared,插件卷/共享目录)、**pmem0=ext4 rootfs 镜像(`root=/dev/pmem0 rootflags=dax,ro`;内核是独立 vmlinux,由 VMM load_kernel 加载)、pmem1=cube-agent.ext4(guest 挂 `/run/support`)**、vsock。guest 的 `/sbin/init` 就是 cube-init。
 
-### 网络数据面(访问沙箱 & 沙箱外发)
-
-```mermaid
-flowchart LR
-    U["客户端"] -->|"Host: port-sandboxid.domain"| P["CubeProxy OpenResty<br/>查 Redis 路由"]
-    P -->|"同节点直连 / 跨节点 DNAT"| VS["cubevs eBPF<br/>内嵌 Cubelet"]
-    VS -->|"TAP"| VM["沙箱内服务"]
-    VM -->|"外发"| VS
-    VS -->|"SNAT / egress 策略默认拒绝"| I["公网"]
-    VS -.->|"可选挂 CubeEgress<br/>域名白名单/凭据注入"| I
-```
-
----
-
-## 五、生命周期接管(CLM)
-
-```mermaid
-flowchart TD
-    L1["创建成功 hook → Redis lifecycle 流"] --> L2["sweeper 每轮<br/>idle = max(LastActive, CreatedAt)"]
-    L2 --> L3{"TimeoutSeconds?"}
-    L3 -->|"< 0"| L4["永不处理"]
-    L3 -->|"已到期"| L5{"AutoPause?"}
-    L5 -->|"pause"| L6["SETNX 抢锁 → 推 pausing 给各 Proxy<br/>CubeMaster pause → Cubelet 拍 CoW 快照 + 收 shim"]
-    L5 -->|"kill"| L7["kill → Proxy 返 410 Gone"]
-    L6 --> L8["Proxy 撞 paused → CLM /internal/resume"]
-    L8 --> L9["SETNX resuming → CubeMaster resume<br/>同 sandboxID 瘦 Create 走 restore_vm"]
-    L9 --> L10["推 running 给 Proxy → 流量恢复"]
-    L10 --> L2
-```
-
-> Proxy 状态门:`pausing→503 Retry-After`、`paused→内部 resume 子请求`、`killed→410`。用户访问被暂停的沙箱时,resume ~100ms,基本无感。
-
----
-
-## 六、勘误清单(最容易误解的 5 点)
-
-1. **CubeOps 的 warehouse(S3 blobstore/tar.gz 上传)与模板无关**——它是节点组件(agent 一键包)仓库。模板 rootfs 存在 CubeMaster 本机磁盘,经 CubeMaster 自己的 HTTP 端点下发。
-2. **模板不是 OCI 镜像,是 VM 快照**:开沙箱是"从模板快照恢复 MicroVM"(docs/guide/templates.md:11)。
-3. **构建工具不是 buildkit**:CubeMaster 主机上的 docker / skopeo+umoci + `mkfs.ext4 -d`;仓库没有 Dockerfile 构建入口。
-4. **模板 ID 规格不可变**:同 ID 重提不同规格会报错(template_image.go:124-129),要改规格换新 ID 或 redo。
-5. **状态存储分散**:业务状态机分在 CubeMaster 实例缓存表(`t_cube_instance_info.ins_state`)、Redis lifecycle state(CLM 视角)、节点本地 cubeboxstore 三处,不在 CubeDB 的某张 sandbox 表里。
-
----
-
-## 附:常见疑问——沙箱有默认生存时间吗?
-
-**没有。** 仓库出厂 `default_timeout_insec: -1`(configs/single-node/cubemaster.yaml:32),客户端不传 `timeout` 的沙箱**永不因空闲被回收**:
-
-| 传入值 | 行为 |
-|---|---|
-| 省略 | 集群 `default_timeout_insec`;仓库默认 -1 → 永不超时 |
-| `NEVER_TIMEOUT`(-1) | 永不超时 |
-| `0` | 立即回收 |
-| 正整数 N | 空闲 N 秒后触发(`on_timeout` 默认 kill,可设 pause) |
-
-归一化唯一落点:`resolveTimeoutSeconds`(CubeMaster/pkg/service/sandbox/util.go:254);执行端是 CLM sweeper。集群运维把 `default_timeout_insec` 改为正数(如 300)即可自动回收不传 TTL 的沙箱,需重启 CubeMaster。

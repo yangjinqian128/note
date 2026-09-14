@@ -1,1 +1,1 @@
-# ai_note
+notes
