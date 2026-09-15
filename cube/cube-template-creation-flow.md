@@ -158,3 +158,67 @@ sequenceDiagram
 
 > 设备形态:virtio-net(host TAP,fd 先从 Cubelet tap 池取——unix socket SCM_RIGHTS,失败才 open /dev/net/tun)、virtio-blk(业务数据卷 → guest `/dev/vdX`)、virtiofs(tag cubeShared,插件卷/共享目录)、**pmem0=ext4 rootfs 镜像(`root=/dev/pmem0 rootflags=dax,ro`;内核是独立 vmlinux,由 VMM load_kernel 加载)、pmem1=cube-agent.ext4(guest 挂 `/run/support`)**、vsock。guest 的 `/sbin/init` 就是 cube-init。
 
+### 恢复视图:快照里什么是旧的、什么是新的
+
+> 从模板恢复沙箱的本质是「旧世界原样复活 + 现场接线」:进程/内核/挂载状态照单全收(快照的收益),stdio/时钟/熵/设备后端逐项换新(快照的代价)。「换新」全部通过恢复后的 guest 内 RPC 执行(ResetVm / CreateSandbox / CreateContainer 恢复分支)——这就是「冻结时刻 guest 活跃度 → 恢复时延」的落点。
+
+```mermaid
+flowchart TD
+    subgraph OLD["❄ 旧世界 · 模板快照(构建时冻结,恢复时原样复活)"]
+        direction TB
+        O1["进程状态:应用 / envd / agent 的<br/>代码+数据页、vCPU/寄存器"]
+        O2["内核状态:page cache、dentry、<br/>netns/路由、容器挂载表"]
+        O3["容器内挂载:模板 rootfs(只读基础)<br/>+ 模板构建期的卷"]
+        O4["应用 stdio:握着旧 shim 的<br/>vsock 连接 —— 对端已死 ✗"]
+        O5["guest 时钟:冻结在构建时刻 ✗"]
+        O6["RNG 状态:恢复后会重放 ✗"]
+        O7["设备槽位 vdX / net-i:<br/>背后是模板卷、模板期 TAP"]
+    end
+
+    subgraph WIRE["🔌 接线 · 创建路径(逐个修复 / 换新)"]
+        direction TB
+        W1["restore_vm:内存灌回,<br/>vdX 同槽位换成 sb-rootfs 克隆、<br/>net-i 换新 TAP(guest 无感)"]
+        W2["connect_agent:建新 vsock 控制通道<br/>(旧通道随旧 shim 已死)"]
+        W3["ResetVm:SetGuestDateTime(校时)<br/>+ ReseedRandomDev(重播种)"]
+        W4["CreateSandbox(RESTORE):<br/>add_virtiofs_storages 挂新卷"]
+        W5["CreateContainer(restore 分支):<br/>find 进程 + passfd 重连<br/>+ mount propagation 进容器 ns"]
+    end
+
+    subgraph NEW["🌱 新世界 · 这个沙箱专属的环境"]
+        direction TB
+        N1["新 shim / containerd / sandboxID<br/>新日志管道"]
+        N2["新 rootfs(sb-rootfs FICLONE 克隆)<br/>+ 新可写层 emptyDir"]
+        N3["新用户卷 / 插件卷(virtiofs)"]
+        N4["新 stdio 通道(日志续上)"]
+        N5["新时间 / 新熵"]
+        N6["新 TAP(同槽位网卡,新 IP/路由)"]
+    end
+
+    O1 -->|"不换,原样复活"| W1
+    O2 -->|"不换,原样复活"| W1
+    O7 -->|"换后端,guest 无感"| W1
+    W1 --> N2
+    W1 --> N6
+    O4 -->|"死连接 → 换新"| W5
+    O3 -->|"缺新卷 → 补挂"| W5
+    W5 --> N4
+    W5 --> N2
+    O5 -->|"冻结时钟 → 校"| W3
+    O6 -->|"重放熵 → 重播"| W3
+    W3 --> N5
+    W4 --> N3
+    W2 --> N1
+```
+
+**读图要点**:三样「原样复活、不换」——进程状态、内核状态、容器内模板挂载(快照的全部价值);五样「现场换新/补新」:
+
+| 旧的(冻在快照里) | 为什么必须换 | 换新动作 |
+|---|---|---|
+| stdio vsock 连接 | 对端旧 shim 已死 | passfd 重连 |
+| 容器 ns 缺新卷 | 新沙箱有专属可写层/用户卷 | mount propagation |
+| guest 时钟 | 冻结在构建时刻 | SetGuestDateTime |
+| RNG 状态 | 所有沙箱会重放同一随机序列 | ReseedRandomDev |
+| 设备后端(vdX / TAP) | 模板卷被共享、网卡接新网络 | 同槽位换后端(guest 无感) |
+
+关键不对称:「不换」的是快照的收益来源,「必须换」的是快照的代价来源——代价全部通过恢复后的 guest 内执行支付。
+

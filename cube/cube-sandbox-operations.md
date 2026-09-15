@@ -184,8 +184,7 @@ cubemastercli template build-watch --build-id <id>
 cubemastercli snapshot create --sandbox-id <id>      # 从运行中沙箱打快照
 cubemastercli snapshot list / info <snapshot-id> / delete <snapshot-id>
 
-cubemastercli rollback --sandbox-id <id> --snapshot-id <snap> [--instance-type <t>] [--json]
-# 别名: cubemastercli sandbox-rollback / sandbox rollback
+cubemastercli sandbox rollback --sandbox-id <id> --snapshot-id <snap> [--instance-type <t>] [--json]
 
 # 进度跟踪
 cubemastercli operation status --operation-id <id>

@@ -1,6 +1,6 @@
 # Agent 沙箱（Agent Sandbox）调研笔记
 
-> 一句话定位：Agent 沙箱是「给 LLM 生成的不可信代码/命令提供受控执行环境」的托管服务——隔离、可观测、可终止、可计费、可快照回滚。它是 AI Agent 的工具执行底座：底层复用虚拟化/容器领域的积累（KVM microVM、内存快照、CoW），但工作负载形态（高频创建销毁、短生命周期、事件驱动）与传统 IaaS/PaaS 完全不同。
+> 广义上，沙箱是指一个受控的、隔离的环境，容器及QEMU虚机都是沙箱。agent沙箱则是「给 LLM 生成的不可信代码/命令提供受控执行环境」的托管服务——隔离、可观测、可终止、可计费、可快照回滚。它是 AI Agent 的工具执行底座：底层复用虚拟化/容器领域的积累（KVM microVM、内存快照、CoW），但工作负载形态（高频创建销毁、短生命周期、事件驱动）与传统 IaaS/PaaS 完全不同。
 >
 > 调研时间：2026-09。以 Cube（腾讯云，KVM microVM 路线，2026-04 已开源）的视角做横向调研；商业产品数据以官方文档与 2025–2026 公开资料为准，关键数字建议对照文末参考链接复核。
 
@@ -171,6 +171,8 @@ microVM 的逃逸面清单与对应防线：
 |---|---|---|---|---|---|---|
 | **Cube Sandbox（腾讯云）** | KVM microVM（RustVMM/Cloud Hypervisor 分支，Shim v2 内嵌） | **<60ms**（内存快照恢复；行业均值约 150ms） | CoW 卷（XFS FICLONE）+ CubeCoW 快照/克隆/原地回滚 API | eBPF VS + L7 出口白名单/断网 + 每沙箱流量 token | 通用 Agent 沙箱（E2B SDK 兼容）、Agentic RL 底座 | 开源 Apache-2.0（2026-04 服务级开源） |
 | **E2B** | Firecracker microVM（每沙箱一 VM，自托管 AWS/GCP 裸金属） | 数百 ms 级（快照恢复）；fork 单请求 ≤100 个 | 沙箱文件 + envd 模板 + Volume + 快照 | nftables egress 防火墙 + 域名黑白名单 | 代码解释器、computer use、Agent 后端 | SDK+runtime 开源（Apache-2.0，活跃），云服务商业 |
+| **AgentENV（Moonshot/kvcache-ai）** | Firecracker microVM 集群 + overlaybd 按需 OCI 镜像 | boot/resume <50ms；pause/增量快照 <100ms | 增量快照；单沙箱同节点 fork ≤16 子沙箱 | —（未披露） | Agentic RL 训练（Kimi K3 底座）、评测 | 开源（MIT，2026-07） |
+| **OpenSandbox（阿里）** | Docker/K8s 编排层（可挂 gVisor/Kata/Firecracker 安全运行时） | K8s 批量创建 100 个约 0.92s（Pool 池化 + BatchSandbox CRD） | 有状态代码执行（execd + Jupyter 内核） | 统一入口网关 + 逐沙箱出口控制 | 编码/GUI Agent、评估、RL 训练、多租户服务 | 开源（Apache-2.0，2025-12） |
 | **Daytona** | Linux 容器为主（另有 VM/Windows/GPU 沙箱） | 宣称 <90ms（池预热）；pause/fork 仅 VM 档 | workspace 卷 + 快照 | 密钥管理、ingress/egress 分控 | 开发环境、编码 Agent、长时任务 | **已闭源（2026-06）**，旧仓库 AGPL-3.0 停维护 |
 | **Modal Sandboxes** | gVisor（runsc）为主；VM Sandboxes（Alpha）补充 | ~1s 级；内存快照提速 2.5×+ | Filesystem/Directory/Memory 三类快照 + Volume | block_network / CIDR / 域名白名单 / 加密隧道 | 数据分析、GPU 计算、Claude Managed Agents 运行时 | 平台商业，SDK 开源（Apache-2.0） |
 | **Fly.io（Machines / Sprites）** | Firecracker microVM | Machines ~300ms；Sprites 唤醒 warm 100–500ms | Volumes/Snapshots；Sprites 持久 ext4 + checkpoint ~300ms | 6PN 私有网络（WireGuard+Anycast）、HTTPS 唤醒 | 边缘应用、有状态 Agent「计算机」 | 商业 |
@@ -271,9 +273,12 @@ microVM 的逃逸面清单与对应防线：
 | AWS Bedrock AgentCore | EC2 托管（Runtime Instances / Code Interpreter） | 会话最长 14 天、Code Interpreter 启动约 100ms 级、每会话独立容器化 microVM | Bedrock Agent 的一等运行时 | GA（2026-08-06） |
 | Google Agent Sandbox（GKE） | gVisor（GKE Sandbox） | 300 sandbox/s、亚秒延迟、TTL 最长 14 天、出站默认阻断 | 开源 K8s SIG Apps 子项目，任意 K8s 可跑 | 发布（2026-04，2026-07 起计费） |
 | microsandbox | libkrun microVM（自托管、rootless） | <100ms 启动、OCI 镜像、MCP server | 开源自托管沙箱（Apache-2.0） | beta |
-| OpenSandbox（阿里） | Docker/K8s 多后端编排抽象层 | — | 国内开源方案（横评定位：抽象层而非新隔离底座） | 开源 |
+| OpenSandbox（阿里） | Docker/K8s 编排层（可挂 gVisor/Kata/Firecracker 安全运行时） | 批量创建 100 个约 0.92s（Pool/BatchSandbox CRD）；统一入口网关 + 逐沙箱出口控制 | 国内开源方案（横评定位：抽象层而非新隔离底座） | 开源（Apache-2.0，2025-12） |
+| AgentENV（Moonshot/kvcache-ai） | Firecracker microVM 集群 + overlaybd 按需 OCI 镜像 | boot/resume <50ms、pause/增量快照 <100ms、单沙箱同节点 fork ≤16 | Kimi K3 的 agentic RL 训练底座（E2B 兼容 API） | 开源（MIT，2026-07） |
 
 收购/整合信号：Baseten 收购 Blaxel（2026-09，microVM 沙箱 suspend/resume 约 25ms）；OpenAI 收购 Ona（原 Gitpod，2026）——沙箱正在成为 AI 基础设施厂商的收购标的。
+
+其中 **AgentENV** 值得单独一提：它是目前**唯一以「RL 训练」为第一场景**的开源沙箱基础设施（Kimi K3 的 agentic RL 训练底座），且**对外暴露 E2B 兼容 API**——与 Cube 同属「microVM + E2B 协议」路线，但目标负载聚焦训练：同节点 fork ≤16 个子沙箱直接服务树状 rollout / 分支采样（与 4.6 的 BPO 类算法同构）。部署要求 Linux 6.8+ / KVM。
 
 ---
 
@@ -465,7 +470,7 @@ microVM 的逃逸面清单与对应防线：
 - [Sandbox GA 博客（2026-04）](https://blog.cloudflare.com/sandbox-ga/) · [Sandbox 文档](https://developers.cloudflare.com/sandbox/) · [Containers 文档](https://developers.cloudflare.com/containers/) · [Browser Run 文档](https://developers.cloudflare.com/browser-run/) · [InfoQ 报道](https://www.infoq.com/news/2026/04/cloudflare-sandboxes-ga/)
 
 **云厂商新入场者**
-- [Vercel Sandbox GA](https://vercel.com/blog/vercel-sandbox-is-now-generally-available) · [Vercel Sandbox 文档/定价](https://vercel.com/docs/vercel-sandbox) · [AWS Lambda MicroVMs 发布](https://aws.amazon.com/cn/about-aws/whats-new/2026/06/aws-lambda-microvms/) · [AWS Bedrock AgentCore Runtime Instances GA](https://aws.amazon.com/cn/about-aws/whats-new/2026/08/aws-bedrock-agentcore-runtime-instances-generally-available/) · [Gemini Enterprise Agent Platform](https://cloud.google.com/blog/products/ai-machine-learning/introducing-gemini-enterprise-agent-platform) · [GKE Agent Sandbox（Next '26）](https://cloud.google.com/blog/products/containers-kubernetes/whats-new-in-gke-at-next26/) · [microsandbox（GitHub）](https://github.com/dwongdev/microsandbox)
+- [Vercel Sandbox GA](https://vercel.com/blog/vercel-sandbox-is-now-generally-available) · [Vercel Sandbox 文档/定价](https://vercel.com/docs/vercel-sandbox) · [AWS Lambda MicroVMs 发布](https://aws.amazon.com/cn/about-aws/whats-new/2026/06/aws-lambda-microvms/) · [AWS Bedrock AgentCore Runtime Instances GA](https://aws.amazon.com/cn/about-aws/whats-new/2026/08/aws-bedrock-agentcore-runtime-instances-generally-available/) · [Gemini Enterprise Agent Platform](https://cloud.google.com/blog/products/ai-machine-learning/introducing-gemini-enterprise-agent-platform) · [GKE Agent Sandbox（Next '26）](https://cloud.google.com/blog/products/containers-kubernetes/whats-new-in-gke-at-next26/) · [microsandbox（GitHub）](https://github.com/dwongdev/microsandbox) · [OpenSandbox（GitHub，阿里开源）](https://github.com/alibaba/OpenSandbox)
 
 **底层技术**
 - [Firecracker FAQ/发布页](https://github.com/firecracker-microvm/firecracker) · [gVisor 官方博客（腾讯生产规模披露）](https://gvisor.dev/blog/index.xml) · [Kata arm64+CH 集成摩擦](https://github.com/AlexanderMattTurner/agent-glovebox/pull/6229)
